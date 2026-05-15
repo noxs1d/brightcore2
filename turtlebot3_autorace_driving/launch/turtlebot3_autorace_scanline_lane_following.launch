@@ -1,0 +1,60 @@
+<launch>
+  <arg name="model" default="burger"/>
+  <arg name="mode" default="action" doc="action drives robot; calibration publishes debug images without driving"/>
+  <arg name="debug" default="false" doc="publish rqt debug image topics in action mode"/>
+  <arg name="debug_rate" default="5.0" doc="max debug image publish rate for rqt"/>
+  <arg name="debug_white_mask" default="false"/>
+  <arg name="use_compressed" default="true"/>
+  <arg name="camera_topic" default="/raspicam_node/image"/>
+  <arg name="camera_compressed_topic" default="/raspicam_node/image/compressed"/>
+  <arg name="resize_width" default="0" doc="resize frames before processing; 0 keeps camera size"/>
+  <arg name="resize_height" default="0" doc="resize frames before processing; 0 keeps camera size"/>
+  <arg name="processing_rate" default="15.0"/>
+  <arg name="process_every_n_frames" default="1"/>
+  <arg name="max_frame_age" default="0.0"/>
+  <arg name="base_linear" default="0.01"/>
+  <arg name="max_linear" default="0.13"/>
+  <arg name="min_linear" default="0.095"/>
+  <arg name="max_angular" default="1.3"/>
+  <arg name="enabled" default="true"/>
+
+  <env name="TURTLEBOT3_MODEL" value="$(arg model)"/>
+
+  <node pkg="turtlebot3_autorace_driving"
+        type="lane_follower_scanline"
+        name="lane_follower_scanline"
+        output="screen">
+    <rosparam file="$(find turtlebot3_autorace_driving)/param/lane_follower_scanline.yaml" command="load"/>
+
+    <param name="use_compressed" value="$(arg use_compressed)"/>
+    <param if="$(eval mode == 'action')" name="enabled" value="$(arg enabled)"/>
+    <param if="$(eval mode == 'calibration')" name="enabled" value="false"/>
+    <param name="camera_topic" value="$(arg camera_topic)"/>
+    <param name="camera_compressed_topic" value="$(arg camera_compressed_topic)"/>
+    <param name="calibration_file"
+           value="$(find turtlebot3_autorace_driving)/calibration/camera_calibration.yaml"/>
+
+    <param name="performance/processing_rate" value="$(arg processing_rate)"/>
+    <param name="performance/resize_width" value="$(arg resize_width)"/>
+    <param name="performance/resize_height" value="$(arg resize_height)"/>
+    <param name="performance/process_every_n_frames" value="$(arg process_every_n_frames)"/>
+    <param name="performance/max_frame_age" value="$(arg max_frame_age)"/>
+    <param name="debug/max_rate" value="$(arg debug_rate)"/>
+    <param name="speed/base_linear" value="$(arg base_linear)"/>
+    <param name="speed/max_linear" value="$(arg max_linear)"/>
+    <param name="speed/min_linear" value="$(arg min_linear)"/>
+    <param name="speed/max_angular" value="$(arg max_angular)"/>
+
+    <param if="$(eval mode == 'action')" name="debug/publish_bird_eye" value="$(arg debug)"/>
+    <param if="$(eval mode == 'action')" name="debug/publish_perspective_overlay" value="$(arg debug)"/>
+    <param if="$(eval mode == 'action')" name="debug/publish_debug" value="$(arg debug)"/>
+    <param if="$(eval mode == 'action')" name="debug/publish_mask" value="$(arg debug)"/>
+    <param if="$(eval mode == 'action')" name="debug/publish_white_mask" value="$(arg debug_white_mask)"/>
+
+    <param if="$(eval mode == 'calibration')" name="debug/publish_bird_eye" value="true"/>
+    <param if="$(eval mode == 'calibration')" name="debug/publish_perspective_overlay" value="true"/>
+    <param if="$(eval mode == 'calibration')" name="debug/publish_debug" value="true"/>
+    <param if="$(eval mode == 'calibration')" name="debug/publish_mask" value="true"/>
+    <param if="$(eval mode == 'calibration')" name="debug/publish_white_mask" value="false"/>
+  </node>
+</launch>

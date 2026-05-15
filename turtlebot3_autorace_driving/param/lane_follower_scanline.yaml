@@ -1,0 +1,117 @@
+debug:
+  publish_bird_eye: true
+  publish_perspective_overlay: true
+  publish_debug: true
+  publish_mask: true
+  publish_white_mask: false
+  max_rate: 5.0
+  show_windows: false
+
+image:
+  width: 410
+  height: 308
+
+performance:
+  resize_width: 0
+  resize_height: 0
+  max_frame_age: 0.0
+  processing_rate: 15.0
+  process_every_n_frames: 1
+
+speed:
+  adaptive: true
+  angular_coupling: 0.05
+  base_linear: 0.06
+  max_linear: 0.08
+  min_linear: 0.05
+  max_angular: 1.8
+  slow_threshold: 10
+  stop_threshold: 80
+
+pid:
+  Kp: 0.010
+  Ki: 0.0
+  Kd: 0.004
+  dead_zone: 4
+  integral_limit: 20.0
+
+ema_alpha: 0.50
+
+detection:
+  lane_color_mode: "yellow_only"
+  roi_top_ratio: 0.30
+  roi_bot_ratio: 1.0
+  scanline_ratios: [0.88, 0.82, 0.76, 0.70, 0.64, 0.58]
+  scanline_weights: [1.0, 0.85, 0.65, 0.45, 0.25, 0.15]
+  scanline_band_height: 20
+  min_segment_width: 8
+  yellow_fence_gap_px: 100
+  yellow_fence_gap_ratio: 0.08
+  expected_lane_width_px: 0
+  expected_lane_width_ratio: 0.45
+  min_lane_width_ratio: 0.15
+  max_lane_width_ratio: 0.90
+  strict_lane_width: true
+  lane_margin_px: 30
+  max_center_jump_px: 80
+  max_lost_frames: 4
+  morph_kernel_size: 5
+  white_morph_kernel_size: 7
+  white_dilate_iterations: 1
+
+control:
+  enable_anti_loop: false
+  single_line_turn_gain: 1.0
+  drive_straight_when_lost: true
+  lost_straight_speed: 0.0
+
+finish:
+  enabled: false
+  min_run_time: 8.0
+  required_frames: 6
+  roi_top_ratio: 0.55
+  min_area: 300
+  max_area: 20000
+  stop_after_detect: true
+
+red_marker:
+  h_low1: 0
+  h_high1: 10
+  h_low2: 170
+  h_high2: 179
+  s_low: 80
+  s_high: 255
+  v_low: 80
+  v_high: 255
+
+yellow_lane:
+  h_low: 6
+  h_high: 48
+  s_low: 60
+  s_high: 255
+  v_low: 40
+  v_high: 255
+
+white_lane:
+  h_low: 0
+  h_high: 179
+  s_low: 0
+  s_high: 75
+  v_low: 160
+  v_high: 255
+
+perspective:
+  dst_margin: 0.15
+  src_top_left: [0.00, 0.38]
+  src_top_right: [1.00, 0.38]
+  src_bottom_left: [0.02, 1.00]
+  src_bottom_right: [0.98, 1.00]
+
+far_perspective:
+  enabled: false
+  min_confidence: 0.18
+  dst_margin: 0.15
+  src_top_left: [0.20, 0.10]
+  src_top_right: [0.40, 0.10]
+  src_bottom_left: [0.20, 0.55]
+  src_bottom_right: [0.76, 0.55]

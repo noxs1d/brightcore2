@@ -1,0 +1,2013 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.  (Apache 2.0 License)
+################################################################################
+# Authors: Leon Jung, Gilbert, Ashe Kim, Special Thanks: Roger Sacchelli
+# Modified by: TEAM BRIGHTCORE
+#
+# CHANGES vs original ROBOTIS code
+# ---------------------------------
+# 1. Yellow road tracking for the main course. White segmentation is disabled
+#    by default because the physical map has white tape that is not a lane.
+# 2. Component + row-track dual extraction with quality-based deduplication.
+# 3. One-lap roundabout guard: detects the roundabout/fork, counts one lap
+#    from /odom yaw when available, then allows the exit pair.
+# 4. Post-circle stability (FIX A):
+#    - Hard center-delta gate: after exiting the circle any pair whose center
+#      at lookahead deviates > POST_CIRCLE_MAX_CENTER_DELTA px from last known
+#      center is rejected before scoring.  Gate is relaxed to 150 px if no
+#    pair survives (avoids freezing when the lane genuinely shifts).
+#    - Continuity bias / center-shift penalty cranked up so the scorer very
+#      strongly prefers staying on the current pair.
+#    - Switch-confirm window raised to 28 frames so transient mis-detections
+#      of the adjacent parallel lane cannot cause a lane switch.
+# 5. Parking straight-through (FIX B):
+#    - After the required post-circle turns are counted, if a very-straight
+#      pair is seen for PARKING_PAIR_REQUIRED frames the robot enters
+#      ROUTE_PARKING and holds straight_hold=True.
+#    - It exits parking mode when the detected pair heading rises above
+#      PARKING_EXIT_HEADING_MIN (robot reaching the exit turn) and then
+#      returns to normal lane follow for the final approach to the finish.
+# 6. Logging: all state-change messages use rospy.logwarn so they appear in
+#    roslaunch output at default verbosity.  For per-frame status use:
+#      roslaunch --screen ... turtlebot3_autorace_control_lane.launch
+#    or add  output="screen"  to the detect_lane node in the launch file.
+################################################################################
+
+import rospy
+import numpy as np
+import cv2
+import math
+from cv_bridge import CvBridge
+from std_msgs.msg import UInt8, Float64
+from sensor_msgs.msg import Image, CompressedImage
+from nav_msgs.msg import Odometry
+from dynamic_reconfigure.server import Server
+from turtlebot3_autorace_detect.cfg import DetectLaneParamsConfig
+
+# ---------------------------------------------------------------------------
+# TUNING KNOBS  –  adjust these without touching logic
+# ---------------------------------------------------------------------------
+
+# ── Post-circle lane-stability ───────────────────────────────────────────────
+# Maximum deviation (px) from last_center_x that a new pair must satisfy.
+# Increase if the robot hesitates / freezes after the circle.
+# Decrease if it still jumps to the adjacent lane.
+POST_CIRCLE_MAX_CENTER_DELTA   = 110.0   # was 90 in previous version
+
+# Frames of the *same* different pair needed before we commit to switching.
+POST_CIRCLE_SWITCH_FRAMES      = 28
+
+# How much extra weight the continuity term gets in scoring (>1 = sticky).
+POST_CIRCLE_CONTINUITY_BIAS    = 5.0
+
+# Additive penalty (px equivalent) when candidate center drifts from current.
+POST_CIRCLE_CENTER_SHIFT_PENALTY = 500.0
+
+# ── Post-circle turn counting ────────────────────────────────────────────────
+# How many distinct turning segments must be counted before the final-straight
+# / parking logic arms.  Set to 1 if there is only one clear turn between the
+# circle exit and the parking road.  Raise to 2 or 3 if there are more.
+POST_CIRCLE_REQUIRED_TURN_SEGMENTS = 2   # TUNE THIS for your physical track
+
+# ── Parking lot ──────────────────────────────────────────────────────────────
+# Consecutive frames of a very-straight pair needed to enter parking mode.
+PARKING_PAIR_REQUIRED      = 8
+
+# Pair heading (px) below which the road counts as "straight" (parking road).
+PARKING_STRAIGHT_HEADING_MAX = 35.0
+
+# Pair heading (px) above which we declare the parking-lot exit turn started.
+PARKING_EXIT_HEADING_MIN   = 45.0
+
+# ── Final straight (post-parking finish approach) ────────────────────────────
+# Consecutive good-pair frames needed to EXIT final-straight-hold mode.
+# Raised from 3 to avoid premature exits during the parking lot passage.
+FINAL_STRAIGHT_CONFIRM_FRAMES = 8
+
+# -- Optional parking white-dash override ------------------------------------
+# Disabled by default via ~use_white_lane_detection=False. Keep these values
+# only for lab/debug runs where white dashed guides are intentionally used.
+PARKING_WHITE_MIN_COMPONENT_AREA = 90
+PARKING_WHITE_MIN_COMPONENT_HEIGHT = 18
+PARKING_WHITE_MAX_COMPONENT_WIDTH = 130
+PARKING_WHITE_MIN_COMPONENT_ASPECT = 0.70
+PARKING_WHITE_CLUSTER_X_GAP = 115.0
+PARKING_WHITE_MIN_CLUSTER_AREA = 180
+PARKING_WHITE_MIN_PAIR_WIDTH = 70.0
+PARKING_WHITE_MAX_PAIR_WIDTH = 430.0
+PARKING_WHITE_MAX_PAIR_WIDTH_DELTA = 130.0
+PARKING_WHITE_LOST_HOLD_FRAMES = 3
+
+# -- Final left turn and finish stop -----------------------------------------
+# After the robot passes the parking road, the CD map requires a
+# left turn into the red full-stop rectangle instead of stopping in parking.
+FINAL_LEFT_MIN_HEADING = 38.0
+FINAL_LEFT_FAR_TARGET_OFFSET = 210.0
+FINAL_LEFT_SWITCH_CONFIRM_FRAMES = 2
+
+FINAL_RED_CONFIRM_FRAMES = 3
+FINAL_RED_ROI_TOP_RATIO = 0.35
+FINAL_RED_MIN_AREA = 650
+FINAL_RED_MIN_WIDTH = 20
+FINAL_RED_MIN_HEIGHT = 14
+FINAL_RED_MIN_SATURATION = 90
+FINAL_RED_MIN_VALUE = 70
+
+# -- Circle / roundabout route enforcement ----------------------------------
+# The first strong turn at the roundabout is NOT allowed to become an exit.
+# We first count one lap, preferably from /odom yaw integration, then enable
+# exit selection.  The frame fallbacks keep the node usable if /odom is absent.
+ENFORCE_CIRCLE_LAP = True
+CIRCLE_ENTRY_MIN_PAIR_OPTIONS = 2
+CIRCLE_MIN_ODOM_DISTANCE_BEFORE_ENTRY = 1.0  # metres, ignored until odom exists
+CIRCLE_LAP_MIN_YAW = 5.35            # radians; about 306 degrees
+CIRCLE_LAP_MIN_FRAMES_NO_ODOM = 115  # processed detect_lane frames
+CIRCLE_LAP_MIN_TURN_FRAMES_NO_ODOM = 45
+CIRCLE_LAP_TURN_PREFERENCE_GAIN = 1.6
+
+# -- Parking straight-through protection ------------------------------------
+# Once the parking road is detected, keep the robot in straight/pass-through
+# mode for a minimum time and require several exit-turn frames before leaving.
+PARKING_MIN_HOLD_FRAMES = 32
+PARKING_EXIT_CONFIRM_FRAMES = 4
+
+
+class DetectLane():
+    def __init__(self):
+        self.hue_white_l = rospy.get_param("~detect/lane/white/hue_l", 0)
+        self.hue_white_h = rospy.get_param("~detect/lane/white/hue_h", 179)
+        self.saturation_white_l = rospy.get_param("~detect/lane/white/saturation_l", 0)
+        self.saturation_white_h = rospy.get_param("~detect/lane/white/saturation_h", 70)
+        self.lightness_white_l = rospy.get_param("~detect/lane/white/lightness_l", 105)
+        self.lightness_white_h = rospy.get_param("~detect/lane/white/lightness_h", 255)
+
+        self.hue_yellow_l = rospy.get_param("~detect/lane/yellow/hue_l", 10)
+        self.hue_yellow_h = rospy.get_param("~detect/lane/yellow/hue_h", 127)
+        self.saturation_yellow_l = rospy.get_param("~detect/lane/yellow/saturation_l", 70)
+        self.saturation_yellow_h = rospy.get_param("~detect/lane/yellow/saturation_h", 255)
+        self.lightness_yellow_l = rospy.get_param("~detect/lane/yellow/lightness_l", 95)
+        self.lightness_yellow_h = rospy.get_param("~detect/lane/yellow/lightness_h", 255)
+
+        self.is_calibration_mode = rospy.get_param("~is_detection_calibration_mode",
+                                                rospy.get_param("/is_detection_calibration_mode", False))
+        self.debug_publish_masks = rospy.get_param("~debug_publish_masks", True)
+        self.debug_route_log = rospy.get_param("~debug_route_log", True)
+        self.use_white_lane_detection = rospy.get_param("~use_white_lane_detection", False)
+        if self.is_calibration_mode:
+            srv_detect_lane = Server(DetectLaneParamsConfig, self.cbGetDetectLaneParam)
+
+        self.sub_image_type = "raw"
+        self.pub_image_type = "compressed"
+
+        if self.sub_image_type == "compressed":
+            self.sub_image_original = rospy.Subscriber(
+                '/detect/image_input/compressed', CompressedImage, self.cbFindLane, queue_size=1)
+        else:
+            self.sub_image_original = rospy.Subscriber(
+                '/detect/image_input', Image, self.cbFindLane, queue_size=1)
+
+        if self.pub_image_type == "compressed":
+            self.pub_image_lane = rospy.Publisher(
+                '/detect/image_output/compressed', CompressedImage, queue_size=1)
+        else:
+            self.pub_image_lane = rospy.Publisher('/detect/image_output', Image, queue_size=1)
+
+        if self.is_calibration_mode or self.debug_publish_masks:
+            if self.pub_image_type == "compressed":
+                self.pub_image_white_lane = rospy.Publisher(
+                    '/detect/image_output_sub1/compressed', CompressedImage, queue_size=1)
+                self.pub_image_yellow_lane = rospy.Publisher(
+                    '/detect/image_output_sub2/compressed', CompressedImage, queue_size=1)
+            else:
+                self.pub_image_white_lane = rospy.Publisher(
+                    '/detect/image_output_sub1', Image, queue_size=1)
+                self.pub_image_yellow_lane = rospy.Publisher(
+                    '/detect/image_output_sub2', Image, queue_size=1)
+
+        self.pub_lane = rospy.Publisher('/detect/lane', Float64, queue_size=1)
+        self.pub_straight_hold_state = rospy.Publisher(
+            '/detect/straight_hold_state', UInt8, queue_size=1)
+        self.pub_yellow_line_reliability = rospy.Publisher(
+            '/detect/yellow_line_reliability', UInt8, queue_size=1)
+        self.pub_white_line_reliability = rospy.Publisher(
+            '/detect/white_line_reliability', UInt8, queue_size=1)
+
+        self.cvBridge = CvBridge()
+        self.counter = 1
+
+        self.window_width  = 1000.
+        self.window_height = 600.
+
+        self.reliability_white_line  = 100
+        self.reliability_yellow_line = 100
+
+        # ── Lane geometry ────────────────────────────────────────────────────
+        self.lane_center_offset     = 330.0
+        self.min_lane_center_offset = 305.0
+        self.max_lane_center_offset = 395.0
+
+        self.min_lane_width       = 460.0
+        self.max_lane_width       = 780.0
+        self.max_lane_width_delta = 220.0
+        self.lane_safety_margin   = 215.0
+
+        # Rate-limit on how fast the center line can jump between frames.
+        # Reduced from 120 to 70 so a single bad frame cannot snap the robot
+        # to the adjacent parallel lane.
+        self.max_center_jump = 70.0
+
+        self.lookahead_y             = 360
+        self.far_validation_y_ratio  = 0.36
+        self.near_validation_y_ratio = 0.86
+
+        self.last_center_x        = None
+        self.lost_center_count    = 0
+        self.lost_center_hold_frames = 2
+
+        # ── Route states ─────────────────────────────────────────────────────
+        self.ROUTE_NORMAL            = 'NORMAL_LANE_FOLLOW'
+        self.ROUTE_CIRCLE_LAP        = 'CIRCLE_LAP_REQUIRED'
+        self.ROUTE_CIRCLE_EXIT       = 'CIRCLE_EXIT_ALLOWED'
+        self.ROUTE_POST_CIRCLE_TURNS = 'POST_CIRCLE_TURNS'
+        self.ROUTE_PARKING           = 'PARKING_PASS_THROUGH'
+        self.ROUTE_FINAL_STRAIGHT    = 'FINAL_STRAIGHT_HOLD'
+        self.ROUTE_FINAL_LEFT        = 'FINAL_LEFT_TO_STOP'
+        self.ROUTE_FINISH_STOP       = 'FINISH_FULL_STOP'
+        self.route_state = self.ROUTE_NORMAL
+
+        # ── Circle / one-lap exit-bias ──────────────────────────────────────
+        self.enforce_circle_lap = rospy.get_param("~enforce_circle_lap",
+                                                 ENFORCE_CIRCLE_LAP)
+        self.use_odom_route_state = rospy.get_param("~use_odom_route_state", True)
+        self.circle_turn_count            = 0
+        self.circle_turn_detect_threshold = rospy.get_param(
+            "~circle_entry_confirm_frames", 8)
+        self.circle_turn_min_heading      = rospy.get_param(
+            "~circle_turn_min_heading", 75.0)
+        self.circle_entry_min_pair_options = rospy.get_param(
+            "~circle_entry_min_pair_options", CIRCLE_ENTRY_MIN_PAIR_OPTIONS)
+        self.circle_min_odom_distance_before_entry = rospy.get_param(
+            "~circle_min_odom_distance_before_entry",
+            CIRCLE_MIN_ODOM_DISTANCE_BEFORE_ENTRY)
+        self.circle_lap_min_yaw = rospy.get_param(
+            "~circle_lap_min_yaw", CIRCLE_LAP_MIN_YAW)
+        self.circle_lap_min_frames_no_odom = rospy.get_param(
+            "~circle_lap_min_frames_no_odom", CIRCLE_LAP_MIN_FRAMES_NO_ODOM)
+        self.circle_lap_min_turn_frames_no_odom = rospy.get_param(
+            "~circle_lap_min_turn_frames_no_odom", CIRCLE_LAP_MIN_TURN_FRAMES_NO_ODOM)
+        self.circle_lap_turn_preference_gain = rospy.get_param(
+            "~circle_lap_turn_preference_gain", CIRCLE_LAP_TURN_PREFERENCE_GAIN)
+
+        self.exit_bias_frames             = 0
+        self.exit_bias_duration           = rospy.get_param(
+            "~circle_exit_bias_duration", 45)
+        self.exit_forward_score_max       = rospy.get_param(
+            "~circle_exit_forward_score_max", 170.0)
+        self.exit_heading_score_max       = rospy.get_param(
+            "~circle_exit_heading_score_max", 150.0)
+
+        self.circle_lap_active            = False
+        self.circle_lap_complete          = False
+        self.circle_lap_frame_count       = 0
+        self.circle_lap_turn_frame_count  = 0
+        self.circle_lap_yaw_accum         = 0.0
+        self.circle_lap_start_distance    = None
+        self.circle_exit_distance         = None
+        self.last_valid_pair_count        = 0
+        self.last_exit_pair_count         = 0
+        self.last_turn_pair_count         = 0
+
+        # /odom is used only for route-state decisions; lane following remains
+        # camera based.  If /odom is absent, the frame-count fallback is used.
+        self.odom_available = False
+        self.odom_x = None
+        self.odom_y = None
+        self.odom_yaw = None
+        self.odom_distance = 0.0
+        self.sub_odom = rospy.Subscriber('/odom', Odometry, self.cbOdom, queue_size=5)
+
+        # ── Post-circle state ────────────────────────────────────────────────
+        self.has_exited_circle               = False
+        self.post_circle_frame_count         = 0
+        self.post_circle_turn_segments       = 0
+        self.post_circle_in_turn             = False
+        self.post_circle_turn_frame_count    = 0
+        self.post_circle_straight_frame_count = 0
+        self.post_circle_required_turn_segments = rospy.get_param(
+            "~post_circle_required_turn_segments", POST_CIRCLE_REQUIRED_TURN_SEGMENTS)
+        self.post_circle_turn_confirm_frames    = rospy.get_param(
+            "~post_circle_turn_confirm_frames", 3)
+        self.post_circle_straight_confirm_frames = rospy.get_param(
+            "~post_circle_straight_confirm_frames", 5)
+        self.post_circle_turn_heading_min       = rospy.get_param(
+            "~post_circle_turn_heading_min", 55.0)
+        self.post_circle_turn_curvature_min     = rospy.get_param(
+            "~post_circle_turn_curvature_min", 80.0)
+
+        self.post_circle_pair_switch_confirm_frames = POST_CIRCLE_SWITCH_FRAMES
+        self.post_circle_continuity_bias            = POST_CIRCLE_CONTINUITY_BIAS
+        self.post_circle_center_shift_penalty       = POST_CIRCLE_CENTER_SHIFT_PENALTY
+        self.post_circle_max_center_delta           = POST_CIRCLE_MAX_CENTER_DELTA
+
+        # ── Pair-switch confirmation memory ──────────────────────────────────
+        self.last_pair_key      = None
+        self.pending_pair_key   = None
+        self.pending_pair_count = 0
+        self.exit_switch_confirm_frames = 3
+
+        # ── Curve clearance ──────────────────────────────────────────────────
+        self.curve_center_bias_max       = 58.0
+        self.curve_center_bias_min_heading = 40.0
+        self.curve_center_bias_gain      = 0.55
+        self.curve_min_lane_clearance    = 250.0
+
+        # ── Final-straight (post-parking finish approach) ────────────────────
+        self.final_straight_armed         = False
+        self.final_straight_active        = False
+        self.final_straight_pair_count    = 0
+        self.final_straight_missing_count = 0
+        self.final_straight_confirm_frames     = FINAL_STRAIGHT_CONFIRM_FRAMES
+        self.final_straight_lost_frames        = 2
+        self.final_straight_single_heading_max = 130.0
+
+        # -- Finish route after parking pass-through --------------------------
+        self.has_seen_parking_guides   = False
+        self.has_passed_parking_guides = False
+        self.final_left_armed          = False
+        self.final_left_turn_started   = False
+        self.final_left_switch_confirm_frames = FINAL_LEFT_SWITCH_CONFIRM_FRAMES
+        self.final_left_min_heading    = FINAL_LEFT_MIN_HEADING
+        self.final_left_far_target_offset = FINAL_LEFT_FAR_TARGET_OFFSET
+        self.finish_stop_active        = False
+        self.finish_stop_count         = 0
+        self.finish_stop_marker        = None
+        self.finish_red_confirm_frames = FINAL_RED_CONFIRM_FRAMES
+
+        # ── Parking lot ──────────────────────────────────────────────────────
+        self.parking_mode_active     = False
+        self.parking_pair_count      = 0
+        self.parking_pair_required   = rospy.get_param(
+            "~parking_pair_required", PARKING_PAIR_REQUIRED)
+        self.parking_straight_heading_max = rospy.get_param(
+            "~parking_straight_heading_max", PARKING_STRAIGHT_HEADING_MAX)
+        self.parking_exit_heading_min     = rospy.get_param(
+            "~parking_exit_heading_min", PARKING_EXIT_HEADING_MIN)
+        self.parking_min_hold_frames      = rospy.get_param(
+            "~parking_min_hold_frames", PARKING_MIN_HOLD_FRAMES)
+        self.parking_exit_confirm_frames  = rospy.get_param(
+            "~parking_exit_confirm_frames", PARKING_EXIT_CONFIRM_FRAMES)
+        self.parking_hold_frame_count     = 0
+        self.parking_exit_frame_count     = 0
+
+        # -- White dashed parking-lot guides ---------------------------------
+        self.white_lane_candidates = []
+        self.parking_white_pair = None
+        self.parking_white_last_center = None
+        self.parking_white_last_width = None
+        self.parking_white_lost_count = 0
+        self.parking_white_override_active = False
+        self.parking_white_min_component_area = PARKING_WHITE_MIN_COMPONENT_AREA
+        self.parking_white_min_component_height = PARKING_WHITE_MIN_COMPONENT_HEIGHT
+        self.parking_white_max_component_width = PARKING_WHITE_MAX_COMPONENT_WIDTH
+        self.parking_white_min_component_aspect = PARKING_WHITE_MIN_COMPONENT_ASPECT
+        self.parking_white_cluster_x_gap = PARKING_WHITE_CLUSTER_X_GAP
+        self.parking_white_min_cluster_area = PARKING_WHITE_MIN_CLUSTER_AREA
+        self.parking_white_min_pair_width = PARKING_WHITE_MIN_PAIR_WIDTH
+        self.parking_white_max_pair_width = PARKING_WHITE_MAX_PAIR_WIDTH
+        self.parking_white_max_pair_width_delta = PARKING_WHITE_MAX_PAIR_WIDTH_DELTA
+        self.parking_white_lost_hold_frames = PARKING_WHITE_LOST_HOLD_FRAMES
+
+        # ── Lane candidate extraction ────────────────────────────────────────
+        self.min_lane_component_area   = 650
+        self.min_lane_component_height = 70
+        self.max_lane_candidates       = 10
+        self.row_track_band_height     = 12
+        self.row_track_step            = 18
+        self.row_track_max_x_gap       = 120.0
+        self.row_track_max_missed      = 2
+        self.row_track_min_points      = 7
+        self.row_track_min_span        = 110.0
+        self.row_track_min_cluster_area = 12
+        self.lane_candidates           = []
+
+        rospy.loginfo("[detect_lane] BRIGHTCORE - node initialised. "
+                      "debug_masks=%s route_log=%s white_detection=%s odom_route=%s enforce_lap=%s",
+                      str(self.debug_publish_masks),
+                      str(self.debug_route_log),
+                      str(self.use_white_lane_detection),
+                      str(self.use_odom_route_state),
+                      str(self.enforce_circle_lap))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Calibration
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def cbGetDetectLaneParam(self, config, level):
+        rospy.loginfo("[Detect Lane] reconfigured lane params")
+        self.hue_white_l      = config.hue_white_l
+        self.hue_white_h      = config.hue_white_h
+        self.saturation_white_l = config.saturation_white_l
+        self.saturation_white_h = config.saturation_white_h
+        self.lightness_white_l  = config.lightness_white_l
+        self.lightness_white_h  = config.lightness_white_h
+        self.hue_yellow_l       = config.hue_yellow_l
+        self.hue_yellow_h       = config.hue_yellow_h
+        self.saturation_yellow_l = config.saturation_yellow_l
+        self.saturation_yellow_h = config.saturation_yellow_h
+        self.lightness_yellow_l  = config.lightness_yellow_l
+        self.lightness_yellow_h  = config.lightness_yellow_h
+        return config
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Image callback
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def cbFindLane(self, image_msg):
+        if self.counter % 3 != 0:
+            self.counter += 1
+            return
+        self.counter = 1
+
+        if self.sub_image_type == "compressed":
+            np_arr  = np.frombuffer(image_msg.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        else:
+            cv_image = self.cvBridge.imgmsg_to_cv2(image_msg, "bgr8")
+
+        _, cv_all_yellow_lane = self.maskYellowLane(cv_image)
+        self.finish_stop_marker = self.detect_finish_stop_marker(cv_image)
+
+        self.white_lane_candidates = []
+        self.parking_white_pair = None
+        if self.use_white_lane_detection:
+            _, cv_all_white_lane = self.maskWhiteLane(cv_image)
+            self.white_lane_candidates = self.extract_lane_candidates(cv_all_white_lane)
+            self.parking_white_pair = self.extract_parking_white_pair(cv_all_white_lane)
+        else:
+            self.publish_disabled_white_detection(cv_image)
+
+        self.lane_candidates = self.extract_lane_candidates(cv_all_yellow_lane)
+        self.make_lane(cv_image)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Masking
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def publish_disabled_white_detection(self, image):
+        self.reliability_white_line = 0
+        msg = UInt8()
+        msg.data = 0
+        self.pub_white_line_reliability.publish(msg)
+
+        if self.is_calibration_mode or self.debug_publish_masks:
+            mask = np.zeros(image.shape[:2], dtype=np.uint8)
+            if self.pub_image_type == "compressed":
+                self.pub_image_white_lane.publish(
+                    self.cvBridge.cv2_to_compressed_imgmsg(mask, "jpg"))
+            else:
+                self.pub_image_white_lane.publish(
+                    self.cvBridge.cv2_to_imgmsg(mask, "mono8"))
+
+    def maskWhiteLane(self, image):
+        hsv  = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower = np.array([self.hue_white_l, self.saturation_white_l, self.lightness_white_l])
+        upper = np.array([self.hue_white_h, self.saturation_white_h, self.lightness_white_h])
+        mask  = cv2.inRange(hsv, lower, upper)
+        res   = cv2.bitwise_and(image, image, mask=mask)
+        fraction_num = np.count_nonzero(mask)
+
+        if not self.is_calibration_mode:
+            if fraction_num > 35000:
+                if self.lightness_white_l < 250:
+                    self.lightness_white_l += 5
+            elif fraction_num < 5000:
+                if self.lightness_white_l > 50:
+                    self.lightness_white_l -= 5
+
+        how_much_short = sum(1 for i in range(600) if np.count_nonzero(mask[i, ::]) > 0)
+        how_much_short = 600 - how_much_short
+
+        if how_much_short > 100:
+            if self.reliability_white_line >= 5:
+                self.reliability_white_line -= 5
+        else:
+            if self.reliability_white_line <= 99:
+                self.reliability_white_line += 5
+
+        msg = UInt8()
+        msg.data = self.reliability_white_line
+        self.pub_white_line_reliability.publish(msg)
+
+        if self.is_calibration_mode or self.debug_publish_masks:
+            if self.pub_image_type == "compressed":
+                self.pub_image_white_lane.publish(
+                    self.cvBridge.cv2_to_compressed_imgmsg(mask, "jpg"))
+            else:
+                self.pub_image_white_lane.publish(
+                    self.cvBridge.cv2_to_imgmsg(mask, "mono8"))
+
+        return fraction_num, mask
+
+    def maskYellowLane(self, image):
+        hsv  = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower = np.array([self.hue_yellow_l, self.saturation_yellow_l, self.lightness_yellow_l])
+        upper = np.array([self.hue_yellow_h, self.saturation_yellow_h, self.lightness_yellow_h])
+        mask  = cv2.inRange(hsv, lower, upper)
+        res   = cv2.bitwise_and(image, image, mask=mask)
+        fraction_num = np.count_nonzero(mask)
+
+        # Yellow threshold kept stable (no auto-adjust) — TEAM BRIGHTCORE
+
+        how_much_short = sum(1 for i in range(600) if np.count_nonzero(mask[i, ::]) > 0)
+        how_much_short = 600 - how_much_short
+
+        if how_much_short > 100:
+            if self.reliability_yellow_line >= 5:
+                self.reliability_yellow_line -= 5
+        else:
+            if self.reliability_yellow_line <= 99:
+                self.reliability_yellow_line += 5
+
+        msg = UInt8()
+        msg.data = self.reliability_yellow_line
+        self.pub_yellow_line_reliability.publish(msg)
+
+        if self.is_calibration_mode or self.debug_publish_masks:
+            if self.pub_image_type == "compressed":
+                self.pub_image_yellow_lane.publish(
+                    self.cvBridge.cv2_to_compressed_imgmsg(mask, "jpg"))
+            else:
+                self.pub_image_yellow_lane.publish(
+                    self.cvBridge.cv2_to_imgmsg(mask, "mono8"))
+
+        return fraction_num, mask
+
+    def detect_finish_stop_marker(self, image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower_red_1 = np.array([0, FINAL_RED_MIN_SATURATION, FINAL_RED_MIN_VALUE])
+        upper_red_1 = np.array([10, 255, 255])
+        lower_red_2 = np.array([170, FINAL_RED_MIN_SATURATION, FINAL_RED_MIN_VALUE])
+        upper_red_2 = np.array([179, 255, 255])
+
+        mask_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
+        mask_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
+        mask = cv2.bitwise_or(mask_1, mask_2)
+
+        height, width = mask.shape[:2]
+        roi_top = int(height * FINAL_RED_ROI_TOP_RATIO)
+        mask[:roi_top, :] = 0
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        try:
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        except Exception:
+            return None
+
+        best_marker = None
+        best_score = 0.0
+        for cid in range(1, n):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            comp_width = int(stats[cid, cv2.CC_STAT_WIDTH])
+            comp_height = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            if area < FINAL_RED_MIN_AREA:
+                continue
+            if comp_width < FINAL_RED_MIN_WIDTH or comp_height < FINAL_RED_MIN_HEIGHT:
+                continue
+
+            x = int(stats[cid, cv2.CC_STAT_LEFT])
+            y = int(stats[cid, cv2.CC_STAT_TOP])
+            cx = float(centroids[cid][0])
+            cy = float(centroids[cid][1])
+            if not (0 <= cx <= width and roi_top <= cy <= height):
+                continue
+
+            score = float(area) + cy * 4.0
+            if score > best_score:
+                best_score = score
+                best_marker = {
+                    'bbox': (x, y, comp_width, comp_height),
+                    'area': area,
+                    'center': (cx, cy),
+                }
+
+        return best_marker
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lane candidate extraction
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def extract_lane_candidates(self, mask):
+        comp = self.extract_component_lane_candidates(mask)
+        rows = self.extract_row_lane_candidates(mask)
+        return self.dedupe_lane_candidates(rows + comp)
+
+    def make_lane_candidate(self, candidate_id, fit, ploty, area, height, bbox, source, quality):
+        fitx = fit[0] * ploty ** 2 + fit[1] * ploty + fit[2]
+        if not np.all(np.isfinite(fitx)):
+            return None
+
+        lookahead_row = int(min(max(self.lookahead_y, 0), len(ploty) - 1))
+        far_row       = int(min(max(len(ploty) * 0.25, 0), len(ploty) - 1))
+        lookahead_x   = float(fitx[lookahead_row])
+        far_x         = float(fitx[far_row])
+
+        return {
+            'id':  candidate_id,
+            'candidate_key': (int(round(lookahead_x / 45.0)), int(round(far_x / 45.0))),
+            'area':         int(area),
+            'height':       float(height),
+            'bbox':         bbox,
+            'fit':          fit,
+            'fitx':         fitx,
+            'lookahead_x':  lookahead_x,
+            'far_x':        far_x,
+            'curvature':    abs(float(fit[0])),
+            'source':       source,
+            'quality':      float(quality),
+        }
+
+    def extract_component_lane_candidates(self, mask):
+        kernel     = np.ones((3, 3), np.uint8)
+        clean_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        try:
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(clean_mask, 8)
+        except Exception:
+            return []
+
+        ploty      = np.linspace(0, mask.shape[0] - 1, mask.shape[0])
+        candidates = []
+
+        for cid in range(1, n):
+            area   = int(stats[cid, cv2.CC_STAT_AREA])
+            height = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            if area < self.min_lane_component_area or height < self.min_lane_component_height:
+                continue
+
+            ys, xs = np.where(labels == cid)
+            if len(xs) < self.min_lane_component_area or len(np.unique(ys)) < 20:
+                continue
+
+            try:
+                fit = np.polyfit(ys, xs, 2)
+            except Exception:
+                continue
+
+            x   = int(stats[cid, cv2.CC_STAT_LEFT])
+            y   = int(stats[cid, cv2.CC_STAT_TOP])
+            w   = int(stats[cid, cv2.CC_STAT_WIDTH])
+            cand = self.make_lane_candidate(
+                cid, fit, ploty, area, height,
+                (x, y, w, height), 'component',
+                height * 0.70 + area * 0.002)
+            if cand:
+                candidates.append(cand)
+
+        return sorted(candidates, key=lambda c: (c['quality'], c['area']), reverse=True)
+
+    def extract_row_lane_candidates(self, mask):
+        height, width  = mask.shape[:2]
+        ploty          = np.linspace(0, height - 1, height)
+        active_tracks  = []
+        finished_tracks = []
+
+        def finish_old_tracks():
+            alive = []
+            for t in active_tracks:
+                if t['missed'] > self.row_track_max_missed:
+                    finished_tracks.append(t)
+                else:
+                    alive.append(t)
+            return alive
+
+        for y_center in range(height - 1, -1, -self.row_track_step):
+            y0   = int(max(0, y_center - self.row_track_band_height / 2))
+            y1   = int(min(height, y_center + self.row_track_band_height / 2 + 1))
+            band = mask[y0:y1, :]
+            clusters = []
+
+            try:
+                nc, lbls, sts, centroids = cv2.connectedComponentsWithStats(band, 8)
+            except Exception:
+                nc = 0
+
+            for cid in range(1, nc):
+                a = int(sts[cid, cv2.CC_STAT_AREA])
+                if a < self.row_track_min_cluster_area:
+                    continue
+                clusters.append({
+                    'x':    float(centroids[cid][0]),
+                    'y':    float(y0 + centroids[cid][1]),
+                    'area': a,
+                })
+
+            clusters = sorted(clusters, key=lambda c: c['x'])
+            matched  = set()
+            updated  = []
+
+            for track in active_tracks:
+                lx, ly, _ = track['points'][-1]
+                best_i, best_d = None, None
+                for ci, c in enumerate(clusters):
+                    if ci in matched:
+                        continue
+                    xd = abs(c['x'] - lx)
+                    yd = abs(c['y'] - ly)
+                    if xd > self.row_track_max_x_gap + 0.08 * yd:
+                        continue
+                    if best_d is None or xd < best_d:
+                        best_i, best_d = ci, xd
+                if best_i is None:
+                    track['missed'] += 1
+                    updated.append(track)
+                else:
+                    c = clusters[best_i]
+                    matched.add(best_i)
+                    track['points'].append((c['x'], c['y'], c['area']))
+                    track['missed'] = 0
+                    updated.append(track)
+
+            active_tracks = updated
+            for ci, c in enumerate(clusters):
+                if ci not in matched:
+                    active_tracks.append({'points': [(c['x'], c['y'], c['area'])], 'missed': 0})
+
+            active_tracks = finish_old_tracks()
+
+        finished_tracks.extend(active_tracks)
+
+        candidates = []
+        next_id    = 1000
+
+        for track in finished_tracks:
+            pts = track['points']
+            if len(pts) < self.row_track_min_points:
+                continue
+
+            xs      = np.array([p[0] for p in pts])
+            ys      = np.array([p[1] for p in pts])
+            weights = np.sqrt(np.array([max(p[2], 1) for p in pts], dtype=np.float64))
+            y_span  = float(np.max(ys) - np.min(ys))
+
+            if y_span < self.row_track_min_span:
+                continue
+
+            try:
+                fit = np.polyfit(ys, xs, 2, w=weights)
+            except Exception:
+                continue
+
+            bbox = (
+                int(max(0, np.min(xs) - 8)),
+                int(max(0, np.min(ys) - 8)),
+                int(min(width,  np.max(xs) - np.min(xs) + 16)),
+                int(min(height, y_span + 16)),
+            )
+            area    = int(np.sum([p[2] for p in pts]))
+            quality = y_span + len(pts) * 24.0 + area * 0.010
+            cand    = self.make_lane_candidate(
+                next_id, fit, ploty, area, y_span, bbox, 'row_track', quality)
+            next_id += 1
+            if cand:
+                candidates.append(cand)
+
+        return candidates
+
+    def dedupe_lane_candidates(self, candidates):
+        candidates = sorted(
+            candidates,
+            key=lambda c: (1 if c['source'] == 'row_track' else 0, c['quality']),
+            reverse=True)
+
+        deduped = []
+        for c in candidates:
+            dup = any(
+                abs(c['lookahead_x'] - e['lookahead_x']) < 38.0 and
+                abs(c['far_x']      - e['far_x'])       < 58.0
+                for e in deduped)
+            if not dup:
+                deduped.append(c)
+            if len(deduped) >= self.max_lane_candidates:
+                break
+
+        return deduped
+
+    # -------------------------------------------------------------------------
+    # Parking-lot white dashed guide extraction
+    # -------------------------------------------------------------------------
+
+    def make_constant_lane_candidate(self, candidate_id, x_value, ploty, area,
+                                     height, bbox, source, quality):
+        fit = np.array([0.0, 0.0, float(x_value)])
+        return self.make_lane_candidate(
+            candidate_id, fit, ploty, area, height, bbox, source, quality)
+
+    def cluster_parking_white_points(self, points):
+        clusters = []
+        for point in sorted(points, key=lambda p: p['x']):
+            matched = None
+            for cluster in clusters:
+                if abs(point['x'] - cluster['mean_x']) <= self.parking_white_cluster_x_gap:
+                    matched = cluster
+                    break
+
+            if matched is None:
+                clusters.append({
+                    'points': [point],
+                    'mean_x': point['x'],
+                    'area': point['area'],
+                })
+            else:
+                matched['points'].append(point)
+                matched['area'] += point['area']
+                weights = np.array([max(p['area'], 1) for p in matched['points']], dtype=np.float64)
+                xs = np.array([p['x'] for p in matched['points']], dtype=np.float64)
+                matched['mean_x'] = float(np.average(xs, weights=weights))
+
+        return clusters
+
+    def make_parking_white_column(self, column_id, points, ploty, image_width, image_height):
+        if not points:
+            return None
+
+        xs = np.array([p['x'] for p in points], dtype=np.float64)
+        ys = np.array([p['y'] for p in points], dtype=np.float64)
+        weights = np.sqrt(np.array([max(p['area'], 1) for p in points], dtype=np.float64))
+        area = int(np.sum([p['area'] for p in points]))
+        y_span = float(np.max(ys) - np.min(ys)) if len(points) > 1 else float(points[0]['height'])
+
+        if area < self.parking_white_min_cluster_area:
+            return None
+
+        try:
+            if len(np.unique(np.round(ys))) >= 3:
+                fit = np.polyfit(ys, xs, 2, w=weights)
+            elif len(np.unique(np.round(ys))) >= 2:
+                fit_1d = np.polyfit(ys, xs, 1, w=weights)
+                fit = np.array([0.0, fit_1d[0], fit_1d[1]])
+            else:
+                return self.make_constant_lane_candidate(
+                    column_id, float(np.average(xs, weights=weights)), ploty,
+                    area, y_span,
+                    (int(max(0, np.min(xs) - 10)),
+                     int(max(0, np.min(ys) - 10)),
+                     20,
+                     int(min(image_height, max(y_span, 1.0) + 20))),
+                    'white_parking', area * 0.02 + len(points) * 80.0)
+        except Exception:
+            return None
+
+        bbox = (
+            int(max(0, np.min(xs) - 10)),
+            int(max(0, np.min(ys) - 10)),
+            int(min(image_width, max(np.max(xs) - np.min(xs), 1.0) + 20)),
+            int(min(image_height, max(y_span, 1.0) + 20)),
+        )
+        quality = area * 0.02 + len(points) * 80.0 + y_span
+        return self.make_lane_candidate(
+            column_id, fit, ploty, area, y_span, bbox, 'white_parking', quality)
+
+    def extract_parking_white_pair(self, mask):
+        height, width = mask.shape[:2]
+        kernel = np.ones((3, 3), np.uint8)
+        clean_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        try:
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_mask, 8)
+        except Exception:
+            return None
+
+        points = []
+        for cid in range(1, n):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            comp_width = int(stats[cid, cv2.CC_STAT_WIDTH])
+            comp_height = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            if area < self.parking_white_min_component_area:
+                continue
+            if comp_height < self.parking_white_min_component_height:
+                continue
+            if comp_width <= 0 or comp_width > self.parking_white_max_component_width:
+                continue
+            if float(comp_height) / float(comp_width) < self.parking_white_min_component_aspect:
+                continue
+
+            cx = float(centroids[cid][0])
+            cy = float(centroids[cid][1])
+            if not (width * 0.08 <= cx <= width * 0.92):
+                continue
+
+            points.append({
+                'x': cx,
+                'y': cy,
+                'area': area,
+                'width': comp_width,
+                'height': comp_height,
+            })
+
+        if len(points) < 2:
+            self.parking_white_lost_count += 1
+            return None
+
+        ploty = np.linspace(0, height - 1, height)
+        columns = []
+        for idx, cluster in enumerate(self.cluster_parking_white_points(points)):
+            column = self.make_parking_white_column(
+                2000 + idx, cluster['points'], ploty, width, height)
+            if column is not None:
+                columns.append(column)
+
+        if len(columns) < 2:
+            self.parking_white_lost_count += 1
+            return None
+
+        rows = self.lane_validation_rows(height)
+        y_idx = int(min(max(self.lookahead_y, 0), height - 1))
+        image_mid = width / 2.0
+        reference = image_mid if self.last_center_x is None else self.last_center_x
+        pairs = []
+
+        columns = sorted(columns, key=lambda c: c['lookahead_x'])
+        for li in range(len(columns)):
+            for ri in range(li + 1, len(columns)):
+                left = columns[li]
+                right = columns[ri]
+                widths = []
+                valid = True
+
+                for row in rows:
+                    lx = float(left['fitx'][row])
+                    rx = float(right['fitx'][row])
+                    pair_width = rx - lx
+                    if not (self.parking_white_min_pair_width <=
+                            pair_width <= self.parking_white_max_pair_width):
+                        valid = False
+                        break
+                    widths.append(pair_width)
+
+                if not valid or max(widths) - min(widths) > self.parking_white_max_pair_width_delta:
+                    continue
+
+                centerx = np.mean([left['fitx'], right['fitx']], axis=0)
+                center_at_lookahead = float(centerx[y_idx])
+                heading = abs(center_at_lookahead - float(centerx[rows[0]]))
+                quality = left['quality'] + right['quality']
+                score = (abs(center_at_lookahead - reference) * 0.75 +
+                         abs(center_at_lookahead - image_mid) * 0.20 +
+                         heading * 0.45 -
+                         quality * 0.020)
+                pairs.append({
+                    'left': left,
+                    'right': right,
+                    'centerx': centerx,
+                    'widths': widths,
+                    'width_delta': max(widths) - min(widths),
+                    'key': (left['candidate_key'], right['candidate_key'], 'white_parking'),
+                    'source': 'white_parking_pair',
+                    'score': score,
+                })
+
+        if not pairs:
+            self.parking_white_lost_count += 1
+            return None
+
+        best_pair = sorted(pairs, key=lambda p: p['score'])[0]
+        try:
+            w_idx = rows.index(y_idx)
+        except ValueError:
+            w_idx = min(1, len(rows) - 1)
+
+        self.parking_white_lost_count = 0
+        self.parking_white_last_center = float(best_pair['centerx'][y_idx])
+        self.parking_white_last_width = float(best_pair['widths'][w_idx])
+        return best_pair
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def clamp_lane_center_offset(self, offset):
+        return max(self.min_lane_center_offset, min(self.max_lane_center_offset, offset))
+
+    def lane_validation_rows(self, height):
+        rows = [
+            int(height * self.far_validation_y_ratio),
+            int(min(max(self.lookahead_y, 0), height - 1)),
+            int(height * self.near_validation_y_ratio),
+        ]
+        return sorted(list(set(int(min(max(r, 0), height - 1)) for r in rows)))
+
+    def normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def cbOdom(self, odom_msg):
+        pos = odom_msg.pose.pose.position
+        q = odom_msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        if self.odom_x is not None and self.odom_y is not None:
+            dx = float(pos.x) - self.odom_x
+            dy = float(pos.y) - self.odom_y
+            step = math.hypot(dx, dy)
+            # Ignore impossible jumps from odom reset or startup transients.
+            if step < 0.35:
+                self.odom_distance += step
+
+        if (self.odom_yaw is not None and self.circle_lap_active and
+                not self.circle_lap_complete):
+            self.circle_lap_yaw_accum += abs(
+                self.normalize_angle(yaw - self.odom_yaw))
+
+        self.odom_x = float(pos.x)
+        self.odom_y = float(pos.y)
+        self.odom_yaw = yaw
+        self.odom_available = True
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Route-state machine
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_route_state(self, route_state, reason):
+        if self.route_state == route_state:
+            return
+        # logwarn so the message appears in roslaunch terminal at default verbosity
+        rospy.logwarn("[Route] %s -> %s  (%s)", self.route_state, route_state, reason)
+        self.route_state = route_state
+
+    def start_circle_lap(self, reason):
+        if self.has_exited_circle or self.circle_lap_active:
+            return
+        self.circle_lap_active = True
+        self.circle_lap_complete = False
+        self.circle_lap_frame_count = 0
+        self.circle_lap_turn_frame_count = 0
+        self.circle_lap_yaw_accum = 0.0
+        self.circle_lap_start_distance = self.odom_distance if self.odom_available else None
+        self.exit_bias_frames = 0
+        self.pending_pair_key = None
+        self.pending_pair_count = 0
+        self.set_route_state(self.ROUTE_CIRCLE_LAP, reason)
+
+    def complete_circle_lap(self, reason):
+        if self.circle_lap_complete:
+            return
+        if not self.circle_lap_active:
+            self.circle_lap_active = True
+            self.circle_lap_frame_count = 0
+            self.circle_lap_turn_frame_count = 0
+        self.circle_lap_complete = True
+        self.exit_bias_frames = self.exit_bias_duration
+        self.pending_pair_key = None
+        self.pending_pair_count = 0
+        self.set_route_state(self.ROUTE_CIRCLE_EXIT, reason)
+
+    def arm_final_left_turn(self, reason):
+        if self.finish_stop_active:
+            return
+
+        self.final_left_armed = True
+        self.final_straight_armed = False
+        self.final_straight_active = False
+        self.final_straight_pair_count = 0
+        self.final_straight_missing_count = 0
+        self.parking_mode_active = False
+        self.parking_pair_count = 0
+        self.parking_hold_frame_count = 0
+        self.parking_exit_frame_count = 0
+        self.last_pair_key = None
+        self.pending_pair_key = None
+        self.pending_pair_count = 0
+        self.set_route_state(self.ROUTE_FINAL_LEFT, reason)
+
+    def update_final_stop_state(self):
+        if self.finish_stop_active:
+            return True
+
+        if not self.final_left_armed:
+            self.finish_stop_count = 0
+            return False
+
+        if self.finish_stop_marker is not None:
+            self.finish_stop_count += 1
+        else:
+            self.finish_stop_count = max(0, self.finish_stop_count - 1)
+
+        if self.finish_stop_count >= self.finish_red_confirm_frames:
+            self.finish_stop_active = True
+            self.final_left_armed = False
+            self.final_left_turn_started = False
+            self.final_straight_active = False
+            self.parking_mode_active = False
+            self.set_route_state(self.ROUTE_FINISH_STOP,
+                                 "red full-stop rectangle detected")
+            return True
+
+        return False
+
+    def is_exit_pair(self, pair, rows, y_idx, image_width):
+        image_mid     = image_width / 2.0
+        far_row       = rows[0]
+        centerx       = pair['centerx']
+        forward_score = abs(float(centerx[far_row]) - image_mid)
+        heading_score = abs(float(centerx[y_idx])   - float(centerx[far_row]))
+        return (forward_score < self.exit_forward_score_max and
+                heading_score < self.exit_heading_score_max)
+
+    def is_straight_single_line(self, selected_single, rows, y_idx):
+        if selected_single is None:
+            return False
+        line     = selected_single['line']
+        far_row  = rows[0]
+        heading  = abs(float(line['fitx'][y_idx]) - float(line['fitx'][far_row]))
+        return heading < self.final_straight_single_heading_max
+
+    def get_pair_heading(self, pair, rows, y_idx):
+        far_row = rows[0]
+        return float(pair['centerx'][y_idx]) - float(pair['centerx'][far_row])
+
+    def get_pair_turn_strength(self, pair, rows, y_idx):
+        if pair is None:
+            return 0.0, 0.0
+        heading  = abs(self.get_pair_heading(pair, rows, y_idx))
+        curv     = (pair['left']['curvature'] + pair['right']['curvature']) * 520000.0
+        return heading, curv
+
+    def is_final_left_pair(self, pair, rows, y_idx, image_width):
+        centerx = pair['centerx']
+        image_mid = image_width / 2.0
+        far_row = rows[0]
+        left_heading = float(centerx[y_idx]) - float(centerx[far_row])
+        far_left_offset = image_mid - float(centerx[far_row])
+        return (left_heading >= self.final_left_min_heading or
+                far_left_offset >= self.final_left_far_target_offset * 0.55)
+
+    def score_final_left_pair(self, pair, rows, y_idx, image_width):
+        centerx = pair['centerx']
+        image_mid = image_width / 2.0
+        reference = image_mid if self.last_center_x is None else self.last_center_x
+        far_row = rows[0]
+        near_row = rows[-1]
+
+        far_x = float(centerx[far_row])
+        lookahead_x = float(centerx[y_idx])
+        near_x = float(centerx[near_row])
+        left_heading = lookahead_x - far_x
+        desired_far_x = image_mid - self.final_left_far_target_offset
+
+        wrong_turn_penalty = max(0.0, -left_heading) * 3.0
+        weak_left_penalty = max(0.0, self.final_left_min_heading - left_heading) * 1.2
+        continuity_score = abs(lookahead_x - reference) * 0.18
+        near_score = abs(near_x - image_mid) * 0.12
+        far_score = abs(far_x - desired_far_x) * 0.65
+        curvature_score = (pair['left']['curvature'] + pair['right']['curvature']) * 220000.0
+        width_score = pair['width_delta'] * 0.25
+        quality_score = (pair['left']['quality'] + pair['right']['quality']) * -0.012
+
+        return (continuity_score +
+                near_score +
+                far_score +
+                wrong_turn_penalty +
+                weak_left_penalty +
+                curvature_score +
+                width_score +
+                quality_score)
+
+    def get_single_turn_strength(self, selected_single, rows, y_idx):
+        if selected_single is None:
+            return 0.0, 0.0
+        line    = selected_single['line']
+        far_row = rows[0]
+        heading = abs(float(line['fitx'][y_idx]) - float(line['fitx'][far_row]))
+        curv    = line['curvature'] * 520000.0
+        return heading, curv
+
+    def update_post_circle_turns(self, selected_pair, selected_single, rows, y_idx):
+        if not self.has_exited_circle or self.final_straight_active:
+            return
+
+        self.post_circle_frame_count += 1
+        ph, pc = self.get_pair_turn_strength(selected_pair,   rows, y_idx)
+        sh, sc = self.get_single_turn_strength(selected_single, rows, y_idx)
+        heading          = max(ph, sh)
+        curvature_strength = max(pc, sc)
+
+        is_turn_like = (heading          > self.post_circle_turn_heading_min or
+                        curvature_strength > self.post_circle_turn_curvature_min)
+
+        if is_turn_like:
+            self.post_circle_turn_frame_count    += 1
+            self.post_circle_straight_frame_count = 0
+            if (not self.post_circle_in_turn and
+                    self.post_circle_turn_frame_count >= self.post_circle_turn_confirm_frames):
+                self.post_circle_turn_segments += 1
+                self.post_circle_in_turn = True
+                rospy.logwarn("[Route] post-circle turn segment %d/%d "
+                              "(heading=%.1f curv=%.1f)",
+                              self.post_circle_turn_segments,
+                              self.post_circle_required_turn_segments,
+                              heading, curvature_strength)
+        else:
+            self.post_circle_straight_frame_count += 1
+            self.post_circle_turn_frame_count      = 0
+            if self.post_circle_straight_frame_count >= self.post_circle_straight_confirm_frames:
+                self.post_circle_in_turn = False
+
+    def log_route_status(self, straight_hold_state, selected_pair, selected_single):
+        if not self.debug_route_log:
+            return
+        pair_source = 'none'
+        if selected_pair is not None:
+            pair_source = selected_pair.get('source', 'yellow_pair')
+        try:
+            rospy.logwarn_throttle(
+                1.0,
+                "[Route] state=%-22s circle=%d lap=%s yaw=%.2f frames=%d "
+                "bias=%d turns=%d/%d parking=%s hold=%d exit=%d "
+                "final_left=%s stop=%s hold=%s pairs=%d/%d pair=%s source=%s single=%s",
+                self.route_state,
+                self.circle_turn_count,
+                str(self.circle_lap_complete),
+                self.circle_lap_yaw_accum,
+                self.circle_lap_frame_count,
+                self.exit_bias_frames,
+                self.post_circle_turn_segments,
+                self.post_circle_required_turn_segments,
+                str(self.parking_mode_active),
+                self.parking_hold_frame_count,
+                self.parking_exit_frame_count,
+                str(self.final_left_armed),
+                str(self.finish_stop_active),
+                str(straight_hold_state),
+                self.last_valid_pair_count,
+                self.last_exit_pair_count,
+                str(selected_pair  is not None),
+                pair_source,
+                str(selected_single is not None))
+        except Exception:
+            pass
+
+    def update_final_straight_state(self, selected_pair, selected_single,
+                                    rows, y_idx, image_width):
+        has_pair = selected_pair is not None
+
+        # ── circle exit detection ────────────────────────────────────────────
+        circle_exit_allowed = (not self.enforce_circle_lap or
+                               self.circle_lap_complete)
+        if (not self.has_exited_circle and has_pair and circle_exit_allowed and
+                self.exit_bias_frames > 0 and
+                self.is_exit_pair(selected_pair, rows, y_idx, image_width)):
+            self.has_exited_circle  = True
+            self.circle_lap_active  = False
+            self.circle_lap_complete = False
+            self.exit_bias_frames   = 0
+            self.circle_turn_count  = 0
+            self.circle_exit_distance = self.odom_distance if self.odom_available else None
+            self.post_circle_frame_count = 0
+            self.post_circle_turn_segments = 0
+            self.post_circle_in_turn = False
+            self.post_circle_turn_frame_count = 0
+            self.post_circle_straight_frame_count = 0
+            self.set_route_state(self.ROUTE_POST_CIRCLE_TURNS, "one-lap circle exit selected")
+
+        self.update_post_circle_turns(selected_pair, selected_single, rows, y_idx)
+
+        # ── arm once enough post-circle turns counted ────────────────────────
+        if (self.has_exited_circle and not self.final_straight_armed and
+                self.post_circle_turn_segments >= self.post_circle_required_turn_segments):
+            self.final_straight_armed = True
+            rospy.logwarn("[Route] final-straight ARMED after %d post-circle turn(s)",
+                          self.post_circle_turn_segments)
+
+        if not self.final_straight_armed:
+            self.final_straight_active        = False
+            self.final_straight_pair_count    = 0
+            self.final_straight_missing_count = 0
+            self.parking_mode_active          = False
+            self.parking_pair_count           = 0
+            return False
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PARKING STRAIGHT-THROUGH
+        # After the final-straight is armed, watch for a sustained straight pair
+        # (the parking road) and hold straight_hold=True until the exit turn.
+        # ══════════════════════════════════════════════════════════════════════
+        if not self.parking_mode_active:
+            if has_pair:
+                pair_heading = abs(self.get_pair_heading(selected_pair, rows, y_idx))
+                if pair_heading < self.parking_straight_heading_max:
+                    self.parking_pair_count += 1
+                else:
+                    # Decay quickly so a momentary straightening during a turn
+                    # doesn't prematurely enter parking mode.
+                    self.parking_pair_count = max(0, self.parking_pair_count - 2)
+
+                if self.parking_pair_count >= self.parking_pair_required:
+                    self.parking_mode_active = True
+                    self.parking_pair_count  = 0
+                    self.parking_hold_frame_count = 0
+                    self.parking_exit_frame_count = 0
+                    self.set_route_state(self.ROUTE_PARKING,
+                                         "parking road detected - pass straight through")
+        else:
+            # ── Already in parking mode: ignore side parking bays.  Keep the
+            # straight/pass-through latch for a minimum number of frames and
+            # require several exit-turn frames before handing control back to
+            # normal lane following.
+            self.parking_hold_frame_count += 1
+            if has_pair:
+                pair_heading = abs(self.get_pair_heading(selected_pair, rows, y_idx))
+                if (self.parking_hold_frame_count >= self.parking_min_hold_frames and
+                        pair_heading > self.parking_exit_heading_min):
+                    self.parking_exit_frame_count += 1
+                else:
+                    self.parking_exit_frame_count = max(0,
+                                                        self.parking_exit_frame_count - 1)
+
+                if self.parking_exit_frame_count >= self.parking_exit_confirm_frames:
+                    # Robot is reaching the parking-road exit. From here the
+                    # CD map route is left into the red full-stop rectangle.
+                    self.has_passed_parking_guides = True
+                    self.arm_final_left_turn("parking exit turn confirmed")
+                    return False   # let lane-follow handle the turn
+            else:
+                self.parking_exit_frame_count = 0
+
+            # Pair lost inside parking lot or still on straight road:
+            # keep holding straight.
+            return True
+
+        # ══════════════════════════════════════════════════════════════════════
+        # POST-PARKING: original final-straight logic for finish-line approach
+        # ══════════════════════════════════════════════════════════════════════
+        if has_pair:
+            self.final_straight_pair_count    += 1
+            self.final_straight_missing_count  = 0
+        elif self.is_straight_single_line(selected_single, rows, y_idx):
+            self.final_straight_missing_count += 1
+            self.final_straight_pair_count     = 0
+        else:
+            self.final_straight_missing_count  = 0
+
+        if self.final_straight_missing_count >= self.final_straight_lost_frames:
+            self.final_straight_active = True
+            self.set_route_state(self.ROUTE_FINAL_STRAIGHT,
+                                  "straight single line after post-parking")
+
+        if (self.final_straight_active and
+                self.final_straight_pair_count >= self.final_straight_confirm_frames):
+            self.final_straight_active    = False
+            self.final_straight_armed     = False
+            self.set_route_state(self.ROUTE_NORMAL,
+                                  "lane pair found after final-straight hold")
+
+        return self.final_straight_active
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Center rate-limiting
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def rate_limit_center(self, centerx, y_idx):
+        if centerx is None or self.last_center_x is None:
+            return centerx
+        center_at_lookahead = float(centerx[y_idx])
+        delta = center_at_lookahead - self.last_center_x
+        if abs(delta) <= self.max_center_jump:
+            return centerx
+        limited = self.last_center_x + np.sign(delta) * self.max_center_jump
+        return centerx - (center_at_lookahead - limited)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lane pair validation and scoring
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def validate_lane_pair(self, left, right, rows, image_width):
+        widths  = []
+        centerx = np.mean([left['fitx'], right['fitx']], axis=0)
+
+        for row in rows:
+            left_x   = float(left['fitx'][row])
+            right_x  = float(right['fitx'][row])
+            center_x = float(centerx[row])
+            width    = right_x - left_x
+
+            if not (np.isfinite(left_x) and np.isfinite(right_x)):
+                return None
+            if left_x >= right_x:
+                return None
+            if not (self.min_lane_width <= width <= self.max_lane_width):
+                return None
+            if width / 2.0 < self.lane_safety_margin:
+                return None
+            if not (-image_width * 0.10 <= center_x <= image_width * 1.10):
+                return None
+            widths.append(width)
+
+        if max(widths) - min(widths) > self.max_lane_width_delta:
+            return None
+
+        return {
+            'left':        left,
+            'right':       right,
+            'centerx':     centerx,
+            'widths':      widths,
+            'width_delta': max(widths) - min(widths),
+            'key':         (left['candidate_key'], right['candidate_key']),
+        }
+
+    def score_lane_pair(self, pair, rows, y_idx, image_width):
+        centerx   = pair['centerx']
+        image_mid = image_width / 2.0
+        reference = image_mid if self.last_center_x is None else self.last_center_x
+        far_row   = rows[0]
+        near_row  = rows[-1]
+
+        continuity_score = abs(float(centerx[y_idx]) - reference)
+        forward_score    = abs(float(centerx[far_row])  - image_mid)
+        near_score       = abs(float(centerx[near_row]) - image_mid)
+        heading_score    = abs(float(centerx[y_idx])    - float(centerx[far_row]))
+        curvature_score  = (pair['left']['curvature'] + pair['right']['curvature']) * 520000.0
+        width_score      = pair['width_delta'] * 0.35
+        quality_score    = (pair['left']['quality'] + pair['right']['quality']) * -0.015
+
+        exit_bonus = 0.0
+        if forward_score < 135.0 and heading_score < 175.0:
+            exit_bonus = 130.0
+            if self.exit_bias_frames > 0:
+                exit_bonus += 190.0
+
+        if (self.has_exited_circle and self.last_center_x is not None and
+                not self.final_left_armed):
+            continuity_score *= self.post_circle_continuity_bias
+            continuity_score += min(
+                abs(float(centerx[y_idx]) - self.last_center_x) * 0.7,
+                self.post_circle_center_shift_penalty)
+
+        return (continuity_score * 0.25 +
+                forward_score    * 1.45 +
+                near_score       * 0.10 +
+                heading_score    * 0.45 +
+                curvature_score  +
+                width_score      +
+                quality_score    -
+                exit_bonus)
+
+    def apply_curve_clearance_bias(self, pair, rows, y_idx):
+        centerx     = np.copy(pair['centerx'])
+        heading     = self.get_pair_heading(pair, rows, y_idx)
+        abs_heading = abs(heading)
+
+        if abs_heading < self.curve_center_bias_min_heading:
+            return centerx
+
+        curv_delta = pair['right']['curvature'] - pair['left']['curvature']
+        direction  = np.sign(curv_delta) if abs(curv_delta) > 0.00002 else np.sign(heading)
+        if direction == 0:
+            return centerx
+
+        requested = min(
+            self.curve_center_bias_max,
+            max(0.0, (abs_heading - self.curve_center_bias_min_heading) *
+                self.curve_center_bias_gain))
+        if requested <= 0.0:
+            return centerx
+
+        allowed = requested
+        for row in rows:
+            lx = float(pair['left']['fitx'][row])
+            rx = float(pair['right']['fitx'][row])
+            cx = float(centerx[row])
+            if direction > 0:
+                allowed = min(allowed, rx - cx - self.curve_min_lane_clearance)
+            else:
+                allowed = min(allowed, cx - lx - self.curve_min_lane_clearance)
+
+        allowed = max(0.0, allowed)
+        if allowed <= 0.0:
+            return centerx
+
+        return centerx + direction * allowed
+
+    def update_circle_exit_bias(self, pair, rows, y_idx):
+        if self.has_exited_circle:
+            self.exit_bias_frames = 0
+            return
+
+        if pair is None:
+            self.circle_turn_count = max(0, self.circle_turn_count - 1)
+            return
+
+        heading = abs(self.get_pair_heading(pair, rows, y_idx))
+        curvature_strength = (pair['left']['curvature'] +
+                              pair['right']['curvature']) * 520000.0
+        is_turn_like = (heading > self.circle_turn_min_heading or
+                        curvature_strength > 120.0)
+
+        if self.circle_lap_active:
+            self.circle_lap_frame_count += 1
+            if is_turn_like:
+                self.circle_lap_turn_frame_count += 1
+
+            if not self.circle_lap_complete:
+                odom_done = (self.use_odom_route_state and self.odom_available and
+                             self.circle_lap_yaw_accum >= self.circle_lap_min_yaw)
+                frame_done = (self.circle_lap_frame_count >=
+                              self.circle_lap_min_frames_no_odom and
+                              self.circle_lap_turn_frame_count >=
+                              self.circle_lap_min_turn_frames_no_odom)
+
+                if odom_done:
+                    self.complete_circle_lap(
+                        "one roundabout lap counted from odom yaw %.2f rad" %
+                        self.circle_lap_yaw_accum)
+                elif (not self.odom_available or not self.use_odom_route_state) and frame_done:
+                    self.complete_circle_lap(
+                        "one roundabout lap counted by frame fallback")
+            else:
+                # Keep looking for the exit until it is actually selected.
+                self.exit_bias_frames = max(self.exit_bias_frames,
+                                            self.exit_bias_duration)
+            return
+
+        # Before the roundabout, do not trigger on every ordinary curve.
+        # Require both sustained turning and multiple viable lane-pair options,
+        # which appears at the roundabout/fork but usually not on simple bends.
+        odom_entry_ok = (not self.odom_available or
+                         self.odom_distance >=
+                         self.circle_min_odom_distance_before_entry)
+        roundabout_like = (odom_entry_ok and
+                           self.last_valid_pair_count >=
+                           self.circle_entry_min_pair_options and
+                           self.last_exit_pair_count >= 1)
+        if is_turn_like and roundabout_like:
+            self.circle_turn_count += 1
+        else:
+            self.circle_turn_count = max(0, self.circle_turn_count - 1)
+
+        if self.circle_turn_count >= self.circle_turn_detect_threshold:
+            if self.enforce_circle_lap:
+                self.start_circle_lap(
+                    "roundabout entry detected - one lap required")
+            else:
+                self.complete_circle_lap(
+                    "circle turn detected - lap enforcement disabled")
+
+        if self.exit_bias_frames > 0 and self.circle_lap_complete:
+            self.exit_bias_frames -= 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # select_lane_pair  (with post-circle hard gate)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def select_lane_pair(self, candidates, rows, y_idx, image_width):
+        pairs = []
+        for li in range(len(candidates)):
+            for ri in range(len(candidates)):
+                if li == ri:
+                    continue
+                left  = candidates[li]
+                right = candidates[ri]
+                if float(left['fitx'][y_idx]) >= float(right['fitx'][y_idx]):
+                    continue
+                pair = self.validate_lane_pair(left, right, rows, image_width)
+                if pair is None:
+                    continue
+                pair['score'] = self.score_lane_pair(pair, rows, y_idx, image_width)
+                pairs.append(pair)
+
+        self.last_valid_pair_count = len(pairs)
+        self.last_exit_pair_count = sum(
+            1 for p in pairs if self.is_exit_pair(p, rows, y_idx, image_width))
+        self.last_turn_pair_count = sum(
+            1 for p in pairs
+            if self.get_pair_turn_strength(p, rows, y_idx)[0] >
+            self.circle_turn_min_heading)
+
+        if not pairs:
+            self.last_valid_pair_count = 0
+            self.last_exit_pair_count = 0
+            self.last_turn_pair_count = 0
+            self.pending_pair_key   = None
+            self.pending_pair_count = 0
+            if not self.has_exited_circle:
+                self.last_pair_key = None
+            return None
+
+        # ── POST-CIRCLE HARD GATE ────────────────────────────────────────────
+        # After the circle, reject any pair whose center at lookahead is more
+        # than post_circle_max_center_delta px from the last known center.
+        # If nothing survives the tight gate, widen to 150 px before giving up,
+        # so the robot doesn't freeze when the lane genuinely shifts.
+        if self.has_exited_circle and self.last_center_x is not None:
+            gated = [p for p in pairs
+                     if abs(float(p['centerx'][y_idx]) - self.last_center_x)
+                        <= self.post_circle_max_center_delta]
+
+            if not gated:
+                # Wider fallback gate
+                gated = [p for p in pairs
+                         if abs(float(p['centerx'][y_idx]) - self.last_center_x)
+                            <= 150.0]
+
+            if gated:
+                pairs = sorted(gated, key=lambda p: p['score'])
+            else:
+                # Nothing within 150 px — prefer current pair if still present
+                pairs = sorted(pairs, key=lambda p: p['score'])
+                cur = [p for p in pairs if p['key'] == self.last_pair_key]
+                if cur:
+                    return cur[0]
+                return None   # hold last_center_x via lost-center logic
+        else:
+            pairs = sorted(pairs, key=lambda p: p['score'])
+
+        if self.circle_lap_active and not self.circle_lap_complete:
+            # During the mandatory lap, reject the straight/forward-looking
+            # exit pair whenever a turning pair is still available.
+            lap_pairs = [p for p in pairs
+                         if not self.is_exit_pair(p, rows, y_idx, image_width)]
+            if lap_pairs:
+                for p in lap_pairs:
+                    heading, curv = self.get_pair_turn_strength(p, rows, y_idx)
+                    p['score'] += max(0.0,
+                                      self.circle_turn_min_heading - heading) * \
+                                  self.circle_lap_turn_preference_gain
+                    p['score'] -= min(160.0, heading * 0.55 + curv * 0.25)
+                pairs = sorted(lap_pairs, key=lambda p: p['score'])
+
+        if (self.circle_lap_complete and not self.has_exited_circle and
+                self.exit_bias_frames > 0):
+            exit_pairs = [p for p in pairs
+                          if self.is_exit_pair(p, rows, y_idx, image_width)]
+            if exit_pairs:
+                pairs = sorted(exit_pairs, key=lambda p: p['score'])
+
+        if self.final_left_armed:
+            final_left_pairs = [p for p in pairs
+                                if self.is_final_left_pair(p, rows, y_idx, image_width)]
+            if final_left_pairs:
+                for p in final_left_pairs:
+                    p['score'] = self.score_final_left_pair(
+                        p, rows, y_idx, image_width)
+                pairs = sorted(final_left_pairs, key=lambda p: p['score'])
+                if not self.final_left_turn_started:
+                    self.final_left_turn_started = True
+                    self.set_route_state(self.ROUTE_FINAL_LEFT,
+                                         "left finish spur selected")
+
+        best_pair = pairs[0]
+
+        # ── circle-exit bias filter ──────────────────────────────────────────
+        if (self.exit_bias_frames > 0 and self.circle_lap_complete and
+                not self.has_exited_circle):
+            exit_pairs = [p for p in pairs
+                          if self.is_exit_pair(p, rows, y_idx, image_width)]
+            if exit_pairs:
+                best_pair = exit_pairs[0]
+
+        switch_confirm = self.exit_switch_confirm_frames
+        if self.final_left_armed:
+            switch_confirm = self.final_left_switch_confirm_frames
+        elif self.circle_lap_active and not self.circle_lap_complete:
+            switch_confirm = max(switch_confirm, 5)
+        elif self.has_exited_circle:
+            switch_confirm = max(switch_confirm,
+                                 self.post_circle_pair_switch_confirm_frames)
+
+        # ── same pair as before: accept immediately ──────────────────────────
+        if self.last_pair_key is None or best_pair['key'] == self.last_pair_key:
+            self.last_pair_key      = best_pair['key']
+            self.pending_pair_key   = None
+            self.pending_pair_count = 0
+            return best_pair
+
+        # ── different pair: require switch_confirm consecutive frames ────────
+        cur_pairs = [p for p in pairs if p['key'] == self.last_pair_key]
+
+        if not cur_pairs:
+            if self.has_exited_circle:
+                if self.pending_pair_key == best_pair['key']:
+                    self.pending_pair_count += 1
+                else:
+                    self.pending_pair_key   = best_pair['key']
+                    self.pending_pair_count = 1
+                if self.pending_pair_count >= switch_confirm:
+                    self.last_pair_key      = best_pair['key']
+                    self.pending_pair_key   = None
+                    self.pending_pair_count = 0
+                    return best_pair
+                return None   # hold last_center_x
+            else:
+                self.last_pair_key      = best_pair['key']
+                self.pending_pair_key   = None
+                self.pending_pair_count = 0
+                return best_pair
+
+        if self.pending_pair_key == best_pair['key']:
+            self.pending_pair_count += 1
+        else:
+            self.pending_pair_key   = best_pair['key']
+            self.pending_pair_count = 1
+
+        if self.pending_pair_count >= switch_confirm:
+            self.last_pair_key      = best_pair['key']
+            self.pending_pair_key   = None
+            self.pending_pair_count = 0
+            return best_pair
+
+        return cur_pairs[0]   # stay on current pair while waiting
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # select_single_line_center
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def select_single_line_center(self, candidates, rows, y_idx, image_width):
+        if not candidates:
+            return None
+
+        image_mid = image_width / 2.0
+        reference = image_mid if self.last_center_x is None else self.last_center_x
+        offset    = self.clamp_lane_center_offset(self.lane_center_offset)
+        options   = []
+
+        for candidate in candidates:
+            line_x = float(candidate['fitx'][y_idx])
+            for direction in [-1.0, 1.0]:
+                centerx = candidate['fitx'] + direction * offset
+                valid   = True
+                for row in rows:
+                    cr = float(centerx[row])
+                    if not (-image_width * 0.10 <= cr <= image_width * 1.10):
+                        valid = False; break
+                    if abs(cr - float(candidate['fitx'][row])) < self.lane_safety_margin:
+                        valid = False; break
+                if not valid:
+                    continue
+
+                side_penalty = 0.0
+                if line_x < image_mid and direction < 0:
+                    side_penalty = 160.0
+                elif line_x > image_mid and direction > 0:
+                    side_penalty = 160.0
+
+                score = (abs(float(centerx[y_idx]) - reference)    * 0.70 +
+                         abs(float(centerx[rows[0]]) - image_mid)  * 0.55 +
+                         candidate['curvature'] * 180000.0 +
+                         side_penalty)
+                options.append({'centerx':   centerx,
+                                'line':      candidate,
+                                'direction': direction,
+                                'score':     score})
+
+        if not options:
+            return None
+        return sorted(options, key=lambda o: o['score'])[0]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Legacy sliding-window (kept for compatibility, not used in main path)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def fit_from_lines(self, lane_fit, image):
+        nonzero  = image.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+        margin   = 100
+        lane_inds = (
+            (nonzerox > (lane_fit[0]*nonzeroy**2 + lane_fit[1]*nonzeroy + lane_fit[2] - margin)) &
+            (nonzerox < (lane_fit[0]*nonzeroy**2 + lane_fit[1]*nonzeroy + lane_fit[2] + margin)))
+        x = nonzerox[lane_inds]; y = nonzeroy[lane_inds]
+        lane_fit  = np.polyfit(y, x, 2)
+        ploty     = np.linspace(0, image.shape[0]-1, image.shape[0])
+        lane_fitx = lane_fit[0]*ploty**2 + lane_fit[1]*ploty + lane_fit[2]
+        return lane_fitx, lane_fit
+
+    def sliding_windown(self, img_w, left_or_right):
+        histogram = np.sum(img_w[int(img_w.shape[0]/2):, :], axis=0)
+        out_img   = np.dstack((img_w, img_w, img_w)) * 255
+        width     = histogram.shape[0]
+        left_limit  = int(width * 0.70)
+        right_start = int(width * 0.30)
+
+        if left_or_right == 'left':
+            sh = histogram[:left_limit]
+            lane_base = int(np.argmax(sh)) if np.max(sh) > 0 else int(width*0.25)
+        else:
+            sh = histogram[right_start:]
+            lane_base = (int(np.argmax(sh)) + right_start) if np.max(sh) > 0 else int(width*0.75)
+
+        nwindows      = 20
+        window_height = int(img_w.shape[0] / nwindows)
+        nonzero  = img_w.nonzero()
+        nonzeroy = np.array(nonzero[0]); nonzerox = np.array(nonzero[1])
+        x_current = lane_base; margin = 50; minpix = 50; lane_inds = []
+
+        for window in range(nwindows):
+            wy_low  = img_w.shape[0] - (window+1)*window_height
+            wy_high = img_w.shape[0] - window*window_height
+            wx_low  = x_current - margin
+            wx_high = x_current + margin
+            cv2.rectangle(out_img, (wx_low,wy_low), (wx_high,wy_high), (0,255,0), 2)
+            good = ((nonzeroy >= wy_low) & (nonzeroy < wy_high) &
+                    (nonzerox >= wx_low) & (nonzerox < wx_high)).nonzero()[0]
+            lane_inds.append(good)
+            if len(good) > minpix:
+                x_current = int(np.mean(nonzerox[good]))
+
+        lane_inds = np.concatenate(lane_inds)
+        x = nonzerox[lane_inds]; y = nonzeroy[lane_inds]
+        try:
+            lane_fit = np.polyfit(y, x, 2); self.lane_fit_bef = lane_fit
+        except Exception:
+            lane_fit = getattr(self, 'lane_fit_bef', np.array([0., 0., float(lane_base)]))
+
+        ploty     = np.linspace(0, img_w.shape[0]-1, img_w.shape[0])
+        lane_fitx = lane_fit[0]*ploty**2 + lane_fit[1]*ploty + lane_fit[2]
+        return lane_fitx, lane_fit
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # make_lane  (decision + drawing + publishing)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def make_lane(self, cv_image):
+        warp_zero       = np.zeros((cv_image.shape[0], cv_image.shape[1], 1), dtype=np.uint8)
+        color_warp      = np.dstack((warp_zero, warp_zero, warp_zero))
+        color_warp_lines = np.dstack((warp_zero, warp_zero, warp_zero))
+
+        ploty     = np.linspace(0, cv_image.shape[0]-1, cv_image.shape[0])
+        y_idx     = int(min(max(self.lookahead_y, 0), cv_image.shape[0]-1))
+        image_mid = cv_image.shape[1] / 2.0
+        vrows     = self.lane_validation_rows(cv_image.shape[0])
+
+        centerx         = None
+        selected_pair   = None
+        selected_single = None
+        parking_white_pair = self.parking_white_pair
+
+        # draw all candidates: yellow candidates in grey, parking white in white
+        for c in self.lane_candidates:
+            pts = np.array([np.transpose(np.vstack([c['fitx'], ploty]))])
+            cv2.polylines(color_warp_lines, np.int32(pts),
+                          isClosed=False, color=(120,120,120), thickness=8)
+        for c in self.white_lane_candidates:
+            pts = np.array([np.transpose(np.vstack([c['fitx'], ploty]))])
+            cv2.polylines(color_warp_lines, np.int32(pts),
+                          isClosed=False, color=(230,230,230), thickness=5)
+
+        # Optional white dashed parking guides. This path is disabled by default
+        # on the physical map so white tape cannot be mistaken for lane edges.
+        if parking_white_pair is not None:
+            selected_pair = parking_white_pair
+            centerx = np.copy(parking_white_pair['centerx'])
+            self.parking_white_override_active = True
+            self.has_seen_parking_guides = True
+            self.last_pair_key = None
+            self.pending_pair_key = None
+            self.pending_pair_count = 0
+            self.circle_turn_count = max(0, self.circle_turn_count - 1)
+            self.set_route_state(self.ROUTE_PARKING,
+                                 "white dashed parking guides detected")
+        else:
+            if (self.parking_white_override_active and
+                    self.parking_white_lost_count > self.parking_white_lost_hold_frames):
+                self.parking_white_override_active = False
+                if (self.has_seen_parking_guides and
+                        not self.has_passed_parking_guides):
+                    self.has_passed_parking_guides = True
+                    self.arm_final_left_turn(
+                        "parking pass-through complete")
+                elif not self.final_left_armed:
+                    self.set_route_state(self.ROUTE_NORMAL,
+                                         "white dashed parking guides lost")
+
+            # ── pair selection ───────────────────────────────────────────────
+            selected_pair = self.select_lane_pair(
+                self.lane_candidates, vrows, y_idx, cv_image.shape[1])
+
+        if selected_pair is not None and selected_pair.get('source') != 'white_parking_pair':
+            centerx = self.apply_curve_clearance_bias(selected_pair, vrows, y_idx)
+            self.update_circle_exit_bias(selected_pair, vrows, y_idx)
+
+            try:
+                w_idx = vrows.index(y_idx)
+            except ValueError:
+                w_idx = 1
+            measured_width = float(selected_pair['widths'][w_idx])
+            self.lane_center_offset = self.clamp_lane_center_offset(
+                0.90 * self.lane_center_offset + 0.10 * (measured_width / 2.0))
+        elif selected_pair is None:
+            selected_single = self.select_single_line_center(
+                self.lane_candidates, vrows, y_idx, cv_image.shape[1])
+
+            if selected_single is not None:
+                if (self.has_exited_circle and
+                        self.post_circle_turn_segments < self.post_circle_required_turn_segments):
+                    selected_single = None
+                else:
+                    centerx = selected_single['centerx']
+                    self.last_pair_key     = None
+                    self.circle_turn_count = max(0, self.circle_turn_count - 1)
+
+            if selected_single is None:
+                if not self.has_exited_circle and not self.circle_lap_active:
+                    self.last_pair_key = None
+                self.pending_pair_key   = None
+                self.pending_pair_count = 0
+                self.circle_turn_count  = max(0, self.circle_turn_count - 1)
+
+        # ── center rate-limit and hold ───────────────────────────────────────
+        if centerx is not None:
+            centerx = self.rate_limit_center(centerx, y_idx)
+            self.lost_center_count = 0
+        else:
+            self.lost_center_count += 1
+            if (self.last_center_x is not None and
+                    self.lost_center_count <= self.lost_center_hold_frames):
+                centerx = np.ones_like(ploty) * self.last_center_x
+            else:
+                centerx = np.ones_like(ploty) * image_mid
+
+        self.is_center_x_exist = centerx is not None
+
+        if selected_pair is not None and selected_pair.get('source') == 'white_parking_pair':
+            straight_hold_state = False
+            self.final_straight_active = False
+            self.parking_mode_active = False
+        else:
+            straight_hold_state = self.update_final_straight_state(
+                selected_pair, selected_single, vrows, y_idx, cv_image.shape[1])
+        final_stop_state = self.update_final_stop_state()
+        self.log_route_status(straight_hold_state, selected_pair, selected_single)
+
+        # ── drawing ──────────────────────────────────────────────────────────
+        if self.is_center_x_exist:
+            if selected_pair is not None:
+                pts_l = np.transpose(np.vstack([selected_pair['left']['fitx'],  ploty]))
+                pts_r = np.flipud(np.transpose(np.vstack([selected_pair['right']['fitx'], ploty])))
+                pair_is_white = selected_pair.get('source') == 'white_parking_pair'
+                left_color = (255,255,255) if pair_is_white else (0,0,255)
+                right_color = (255,255,255) if pair_is_white else (255,255,0)
+                fill_color = (255,80,0) if pair_is_white else (0,255,0)
+                cv2.polylines(color_warp_lines, np.int32([pts_l]),
+                              isClosed=False, color=left_color, thickness=25)
+                cv2.polylines(color_warp_lines, np.int32([np.flipud(pts_r)]),
+                              isClosed=False, color=right_color, thickness=25)
+                cv2.fillPoly(color_warp, np.int32([np.vstack((pts_l, pts_r))]),
+                             fill_color)
+            elif selected_single is not None:
+                pts = np.array([np.transpose(np.vstack([selected_single['line']['fitx'], ploty]))])
+                cv2.polylines(color_warp_lines, np.int32(pts),
+                              isClosed=False, color=(255,120,0), thickness=20)
+
+            pts_c = np.array([np.transpose(np.vstack([centerx, ploty]))])
+            cv2.polylines(color_warp_lines, np.int32(pts_c),
+                          isClosed=False, color=(0,255,255), thickness=12)
+
+            self.last_center_x = float(centerx[y_idx])
+
+        if self.finish_stop_marker is not None:
+            x, y, w, h = self.finish_stop_marker['bbox']
+            cv2.rectangle(color_warp_lines, (x, y), (x + w, y + h),
+                          (0,0,255), 4)
+
+        # ── publish ──────────────────────────────────────────────────────────
+        final = cv2.addWeighted(cv_image, 1, color_warp,       0.2, 0)
+        final = cv2.addWeighted(final,    1, color_warp_lines, 1.0, 0)
+
+        msg_sh = UInt8()
+        msg_sh.data = 2 if final_stop_state else (1 if straight_hold_state else 0)
+        self.pub_straight_hold_state.publish(msg_sh)
+
+        if self.pub_image_type == "compressed":
+            if self.is_center_x_exist:
+                msg = Float64()
+                msg.data = float(centerx.item(y_idx))
+                self.pub_lane.publish(msg)
+            self.pub_image_lane.publish(
+                self.cvBridge.cv2_to_compressed_imgmsg(final, "jpg"))
+        else:
+            if self.is_center_x_exist:
+                msg = Float64()
+                msg.data = float(centerx.item(y_idx))
+                self.pub_lane.publish(msg)
+            self.pub_image_lane.publish(
+                self.cvBridge.cv2_to_imgmsg(final, "bgr8"))
+
+    def main(self):
+        rospy.spin()
+
+
+if __name__ == '__main__':
+    rospy.init_node('detect_lane')
+    node = DetectLane()
+    node.main()

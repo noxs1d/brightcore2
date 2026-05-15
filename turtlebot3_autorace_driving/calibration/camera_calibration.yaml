@@ -1,0 +1,27 @@
+camera_matrix:
+  cols: 3
+  data:
+  - 397.4826178112822
+  - 0.0
+  - 203.23741071923402
+  - 0.0
+  - 396.72840577617274
+  - 148.43208718290705
+  - 0.0
+  - 0.0
+  - 1.0
+  rows: 3
+camera_name: turtlebot3_camera
+distortion_coefficients:
+  cols: 5
+  data:
+  - 0.23310258346816157
+  - -0.6956698994560933
+  - 0.0005306575540887079
+  - -0.0015865414479055635
+  - 0.2729996886373447
+  rows: 1
+distortion_model: plumb_bob
+image_height: 308
+image_width: 410
+reprojection_error: 0.01929365694676488

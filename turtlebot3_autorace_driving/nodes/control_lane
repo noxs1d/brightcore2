@@ -1,0 +1,159 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+# Author: Leon Jung, Gilbert, Ashe Kim
+ 
+from cv2 import error
+
+import rospy
+import numpy as np
+from std_msgs.msg import Float64, UInt8
+from geometry_msgs.msg import Twist
+
+class ControlLane():
+    def __init__(self):
+        self.sub_lane = rospy.Subscriber('/control/lane', Float64, self.cbFollowLane, queue_size = 1)
+        self.sub_max_vel = rospy.Subscriber('/control/max_vel', Float64, self.cbGetMaxVel, queue_size = 1)
+        self.sub_straight_hold = rospy.Subscriber('/detect/straight_hold_state', UInt8, self.cbGetStraightHoldState, queue_size = 1)
+        self.pub_cmd_vel = rospy.Publisher('/control/cmd_vel', Twist, queue_size = 1)
+
+        self.lastError = 0
+        self.MAX_VEL = 0.22
+        self.STRAIGHT_HOLD_VEL = rospy.get_param("~straight_hold_vel", 0.09)
+        self.STRAIGHT_HOLD_KP = rospy.get_param("~straight_hold_kp", 0.0010)
+        self.STRAIGHT_HOLD_KD = rospy.get_param("~straight_hold_kd", 0.0015)
+        self.STRAIGHT_HOLD_DEADBAND = rospy.get_param("~straight_hold_deadband", 35.0)
+        self.STRAIGHT_HOLD_MAX_ANG = rospy.get_param("~straight_hold_max_ang", 0.22)
+        self.is_straight_hold_active = False
+        self.is_full_stop_active = False
+        self.route_control_state = 0
+        self.reset_error_on_pair = False
+
+        rospy.on_shutdown(self.fnShutDown)
+
+    def cbGetMaxVel(self, max_vel_msg):
+        self.MAX_VEL = max_vel_msg.data
+
+    def cbGetStraightHoldState(self, straight_hold_msg):
+        route_control_state = straight_hold_msg.data
+        is_full_stop_active = route_control_state >= 2
+        is_straight_hold_active = route_control_state == 1
+
+        if is_full_stop_active == True and self.is_full_stop_active == False:
+            rospy.loginfo("[Route] control_lane: FINAL_FULL_STOP")
+            self.publish_stop()
+        elif is_straight_hold_active == False and self.is_straight_hold_active == True:
+            self.reset_error_on_pair = True
+            rospy.loginfo("[Route] control_lane: LANE_FOLLOW")
+        elif is_straight_hold_active == True and self.is_straight_hold_active == False:
+            rospy.loginfo("[Route] control_lane: FINAL_STRAIGHT_HOLD")
+
+        self.is_straight_hold_active = is_straight_hold_active
+        self.is_full_stop_active = is_full_stop_active
+        self.route_control_state = route_control_state
+
+    def publish_stop(self):
+        twist = Twist()
+        twist.linear.x = 0
+        twist.linear.y = 0
+        twist.linear.z = 0
+        twist.angular.x = 0
+        twist.angular.y = 0
+        twist.angular.z = 0
+        self.pub_cmd_vel.publish(twist)
+
+    def cbFollowLane(self, desired_center):
+        center = desired_center.data
+
+        error = center - 500
+
+        Kp = 0.0028
+        Kd = 0.006
+
+        max_vel = min(max(self.MAX_VEL, 0.0), 0.22)
+        twist = Twist()
+
+        if self.is_full_stop_active == True:
+            self.publish_stop()
+            return
+
+        if self.is_straight_hold_active == True:
+            # Parking/pass-through mode: keep moving mostly straight, but allow
+            # a very small correction if the whole corridor drifts in the
+            # camera.  This avoids steering hard into side parking bays while
+            # still compensating for mechanical drift.
+            delta_error = error - self.lastError
+            if abs(error) <= self.STRAIGHT_HOLD_DEADBAND:
+                angular_z = 0.0
+            else:
+                angular_z = (self.STRAIGHT_HOLD_KP * error +
+                             self.STRAIGHT_HOLD_KD * delta_error)
+            self.lastError = error
+
+            angular_z = max(-self.STRAIGHT_HOLD_MAX_ANG,
+                            min(self.STRAIGHT_HOLD_MAX_ANG, angular_z))
+            twist.linear.x = -min(self.STRAIGHT_HOLD_VEL, max_vel)
+            twist.linear.y = 0
+            twist.linear.z = 0
+            twist.angular.x = 0
+            twist.angular.y = 0
+            twist.angular.z = angular_z
+            self.pub_cmd_vel.publish(twist)
+            return
+
+        if self.reset_error_on_pair == True:
+            self.lastError = error
+            self.reset_error_on_pair = False
+
+        delta_error = error - self.lastError
+        angular_z = Kp * error + Kd * delta_error
+        self.lastError = error
+        
+        if max_vel <= 0.0:
+            twist.linear.x = 0.0
+        else:
+            min_vel = min(0.08, max_vel)
+
+            error_score = min(abs(error) / 260.0, 1.0)
+            steer_score = min(abs(angular_z) / 1.2, 1.0)
+            change_score = min(abs(delta_error) / 90.0, 1.0)
+            turn_score = max(error_score, steer_score, change_score)
+
+            speed_ratio = (1.0 - turn_score) ** 1.8
+            twist.linear.x = -(min_vel + (max_vel - min_vel) * speed_ratio)
+
+        twist.linear.y = 0
+        twist.linear.z = 0
+        twist.angular.x = 0
+        twist.angular.y = 0
+        twist.angular.z = max(angular_z, -2.0) if angular_z < 0 else min(angular_z, 2.0)
+        self.pub_cmd_vel.publish(twist)
+
+    def fnShutDown(self):
+        rospy.loginfo("Shutting down. cmd_vel will be 0")
+
+        self.publish_stop() 
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('control_lane')
+    node = ControlLane()
+    node.main()

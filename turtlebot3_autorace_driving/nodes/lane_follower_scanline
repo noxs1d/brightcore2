@@ -1,0 +1,1283 @@
+#!/usr/bin/env python3
+
+import os
+import threading
+
+import cv2
+import numpy as np
+import rospy
+import yaml
+from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import Bool, Float32
+
+
+class LaneFollower:
+
+    def __init__(self):
+        rospy.init_node('lane_follower', anonymous=False)
+        rospy.loginfo("=== Lane Follower hybrid scanline ===")
+
+        self.bridge = CvBridge()
+        self._load_params()
+        self._load_calibration(rospy.get_param(
+            '~calibration_file',
+            os.path.join(os.path.dirname(__file__),
+                         '../calibration/camera_calibration.yaml')))
+
+        self.error_prev = 0.0
+        self.pid_error_prev = 0.0
+        self.error_integral = 0.0
+        self.error_smooth = 0.0
+        self.last_time = rospy.Time.now()
+
+        self.last_left_cx = None
+        self.last_right_cx = None
+        self.last_scanline_left = {}
+        self.last_scanline_right = {}
+        self.last_lane_center = None
+        self.last_lane_source = 'INIT'
+        self.active_lane_source = 'INIT'
+        self.lost_frames = 0
+        self.frame_count = 0
+        self.processed_frame_count = 0
+        self.drive_enabled = rospy.get_param('~enabled', True)
+        self.start_time = rospy.Time.now()
+        self.finish_detected_frames = 0
+        self.finished = False
+        self.finish_logged = False
+        self._latest_lock = threading.Lock()
+        self._latest_msg = None
+        self._latest_is_compressed = True
+        self._dropped_pending_frames = 0
+        self._last_debug_pub_time = rospy.Time(0)
+
+        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.error_pub = rospy.Publisher('/lane_error', Float32, queue_size=1)
+        if self.debug_bird:
+            self.bird_pub = rospy.Publisher('/lane/bird_eye', Image, queue_size=1)
+        if self.debug_perspective:
+            self.perspective_pub = rospy.Publisher('/lane/perspective_overlay', Image, queue_size=1)
+        if self.debug_mask:
+            self.mask_pub = rospy.Publisher('/lane/yellow_mask', Image, queue_size=1)
+        if self.debug_white_mask:
+            self.white_mask_pub = rospy.Publisher('/lane/white_mask', Image, queue_size=1)
+        if self.finish_enabled and self.debug_mask:
+            self.red_mask_pub = rospy.Publisher('/lane/red_mask', Image, queue_size=1)
+        if self.debug_img:
+            self.debug_pub = rospy.Publisher('/lane/debug_image', Image, queue_size=1)
+
+        self.use_compressed = rospy.get_param('~use_compressed', True)
+        self._latest_is_compressed = self.use_compressed
+        self.image_topic = rospy.get_param('~camera_topic', '/camera/image')
+        self.compressed_topic = rospy.get_param(
+            '~camera_compressed_topic', self.image_topic + '/compressed')
+
+        if self.use_compressed:
+            self.image_sub = rospy.Subscriber(
+                self.compressed_topic, CompressedImage, self._image_cb,
+                queue_size=1, buff_size=2**24, tcp_nodelay=True)
+            rospy.loginfo(f"Subscribing to {self.compressed_topic}")
+        else:
+            self.image_sub = rospy.Subscriber(
+                self.image_topic, Image, self._image_cb_raw,
+                queue_size=1, buff_size=2**24, tcp_nodelay=True)
+            rospy.loginfo(f"Subscribing to {self.image_topic}")
+
+        self.enable_sub = rospy.Subscriber(
+            '/lane_following/enable', Bool, self._enable_cb, queue_size=1)
+        rospy.on_shutdown(self._shutdown)
+        self._no_frame_start = rospy.Time.now()
+        self._no_frame_warned = False
+        rospy.loginfo(
+            f"Ready. Waiting for camera frames... processing_rate={self.processing_rate:.1f}Hz")
+
+    def _load_params(self):
+        self.base_speed = rospy.get_param('~speed/base_linear', 0.04)
+        self.max_speed = rospy.get_param('~speed/max_linear', 0.06)
+        self.min_speed = rospy.get_param('~speed/min_linear', 0.018)
+        self.max_angular = rospy.get_param('~speed/max_angular', 1.35)
+        self.angular_coupling = rospy.get_param('~speed/angular_coupling', 0.2)
+        self.adaptive = rospy.get_param('~speed/adaptive', True)
+        self.slow_thresh = rospy.get_param('~speed/slow_threshold', 32)
+        self.stop_thresh = rospy.get_param('~speed/stop_threshold', 95)
+
+        self.Kp = rospy.get_param('~pid/Kp', 0.006)
+        self.Ki = rospy.get_param('~pid/Ki', 0.0)
+        self.Kd = rospy.get_param('~pid/Kd', 0.003)
+        self.dead_zone = rospy.get_param('~pid/dead_zone', 6)
+        self.integral_limit = rospy.get_param('~pid/integral_limit', 20.0)
+        self.ema_alpha = rospy.get_param('~ema_alpha', 0.35)
+
+        self.yellow_low = np.array([
+            rospy.get_param('~yellow_lane/h_low', 18),
+            rospy.get_param('~yellow_lane/s_low', 50),
+            rospy.get_param('~yellow_lane/v_low', 90)])
+        self.yellow_high = np.array([
+            rospy.get_param('~yellow_lane/h_high', 45),
+            rospy.get_param('~yellow_lane/s_high', 255),
+            rospy.get_param('~yellow_lane/v_high', 255)])
+        self.white_low = np.array([
+            rospy.get_param('~white_lane/h_low', 0),
+            rospy.get_param('~white_lane/s_low', 0),
+            rospy.get_param('~white_lane/v_low', 160)])
+        self.white_high = np.array([
+            rospy.get_param('~white_lane/h_high', 179),
+            rospy.get_param('~white_lane/s_high', 75),
+            rospy.get_param('~white_lane/v_high', 255)])
+
+        self.src_tl = rospy.get_param('~perspective/src_top_left', [0.18, 0.50])
+        self.src_tr = rospy.get_param('~perspective/src_top_right', [0.82, 0.50])
+        self.src_bl = rospy.get_param('~perspective/src_bottom_left', [0.05, 0.95])
+        self.src_br = rospy.get_param('~perspective/src_bottom_right', [0.95, 0.95])
+        self.dst_margin = rospy.get_param('~perspective/dst_margin', 0.15)
+        self.far_enabled = rospy.get_param('~far_perspective/enabled', True)
+        self.far_src_tl = rospy.get_param('~far_perspective/src_top_left', [0.18, 0.45])
+        self.far_src_tr = rospy.get_param('~far_perspective/src_top_right', [0.85, 0.45])
+        self.far_src_bl = rospy.get_param('~far_perspective/src_bottom_left', [0.18, 0.75])
+        self.far_src_br = rospy.get_param('~far_perspective/src_bottom_right', [0.85, 0.75])
+        self.far_dst_margin = rospy.get_param('~far_perspective/dst_margin', self.dst_margin)
+        self.far_min_confidence = rospy.get_param('~far_perspective/min_confidence', 0.18)
+
+        self.lane_color_mode = rospy.get_param('~detection/lane_color_mode', 'auto')
+        if self.lane_color_mode not in ('yellow_only', 'white_yellow', 'auto'):
+            rospy.logwarn(f"Unknown lane_color_mode '{self.lane_color_mode}', using auto")
+            self.lane_color_mode = 'auto'
+        self.roi_top = rospy.get_param('~detection/roi_top_ratio', 0.45)
+        self.roi_bot = rospy.get_param('~detection/roi_bot_ratio', 1.0)
+        self.scanline_ratios = rospy.get_param(
+            '~detection/scanline_ratios', [0.88, 0.80, 0.72, 0.64, 0.56, 0.48, 0.40])
+        self.scanline_weights = rospy.get_param(
+            '~detection/scanline_weights', [1.0, 0.95, 0.85, 0.75, 0.60, 0.45, 0.30])
+        self.scanline_band_height = rospy.get_param('~detection/scanline_band_height', 20)
+        self.min_segment_width = rospy.get_param('~detection/min_segment_width', 8)
+        self.yellow_fence_gap_px = rospy.get_param('~detection/yellow_fence_gap_px', 0)
+        self.yellow_fence_gap_ratio = rospy.get_param('~detection/yellow_fence_gap_ratio', 0.08)
+        self.expected_lane_width_px = rospy.get_param('~detection/expected_lane_width_px', 0)
+        self.expected_lane_width_ratio = rospy.get_param('~detection/expected_lane_width_ratio', 0.45)
+        self.min_lane_width_ratio = rospy.get_param('~detection/min_lane_width_ratio', 0.15)
+        self.max_lane_width_ratio = rospy.get_param('~detection/max_lane_width_ratio', 0.90)
+        self.strict_lane_width = rospy.get_param('~detection/strict_lane_width', True)
+        self.lane_margin_px = rospy.get_param('~detection/lane_margin_px', 30)
+        self.max_center_jump_px = rospy.get_param('~detection/max_center_jump_px', 160)
+        self.max_lost_frames = rospy.get_param('~detection/max_lost_frames', 8)
+        self.morph_kernel_size = rospy.get_param('~detection/morph_kernel_size', 5)
+        self.white_morph_kernel_size = rospy.get_param('~detection/white_morph_kernel_size', 7)
+        self.white_dilate_iterations = rospy.get_param('~detection/white_dilate_iterations', 1)
+        self.enable_anti_loop = rospy.get_param('~control/enable_anti_loop', False)
+        self.single_line_turn_gain = rospy.get_param('~control/single_line_turn_gain', 1.5)
+        self.drive_straight_when_lost = rospy.get_param('~control/drive_straight_when_lost', True)
+        self.lost_straight_speed = rospy.get_param('~control/lost_straight_speed', 0.0)
+
+        self.finish_enabled = rospy.get_param('~finish/enabled', True)
+        self.finish_min_run_time = rospy.get_param('~finish/min_run_time', 8.0)
+        self.finish_required_frames = rospy.get_param('~finish/required_frames', 6)
+        self.finish_roi_top = rospy.get_param('~finish/roi_top_ratio', 0.55)
+        self.finish_min_area = rospy.get_param('~finish/min_area', 300)
+        self.finish_max_area = rospy.get_param('~finish/max_area', 20000)
+        self.finish_stop_after_detect = rospy.get_param('~finish/stop_after_detect', True)
+        self.red_low1 = np.array([
+            rospy.get_param('~red_marker/h_low1', 0),
+            rospy.get_param('~red_marker/s_low', 80),
+            rospy.get_param('~red_marker/v_low', 80)])
+        self.red_high1 = np.array([
+            rospy.get_param('~red_marker/h_high1', 10),
+            rospy.get_param('~red_marker/s_high', 255),
+            rospy.get_param('~red_marker/v_high', 255)])
+        self.red_low2 = np.array([
+            rospy.get_param('~red_marker/h_low2', 170),
+            rospy.get_param('~red_marker/s_low', 80),
+            rospy.get_param('~red_marker/v_low', 80)])
+        self.red_high2 = np.array([
+            rospy.get_param('~red_marker/h_high2', 179),
+            rospy.get_param('~red_marker/s_high', 255),
+            rospy.get_param('~red_marker/v_high', 255)])
+
+        self.resize_width = rospy.get_param('~performance/resize_width', 0)
+        self.resize_height = rospy.get_param('~performance/resize_height', 0)
+        self.max_frame_age = rospy.get_param('~performance/max_frame_age', 0.30)
+        self.processing_rate = max(
+            1.0, float(rospy.get_param('~performance/processing_rate', 20.0)))
+        self.process_every_n_frames = max(
+            1, int(rospy.get_param('~performance/process_every_n_frames', 1)))
+
+        self.img_w = rospy.get_param('~image/width', 640)
+        self.img_h = rospy.get_param('~image/height', 480)
+        self.debug_bird = rospy.get_param('~debug/publish_bird_eye', True)
+        self.debug_perspective = rospy.get_param('~debug/publish_perspective_overlay', True)
+        self.debug_mask = rospy.get_param('~debug/publish_mask', True)
+        self.debug_white_mask = rospy.get_param('~debug/publish_white_mask', True)
+        self.debug_img = rospy.get_param('~debug/publish_debug', True)
+        self.debug_max_rate = float(rospy.get_param('~debug/max_rate', 5.0))
+        self.show_windows = rospy.get_param('~debug/show_windows', False)
+
+        rospy.loginfo(f"Mode: {self.lane_color_mode}")
+        rospy.loginfo(f"PID: Kp={self.Kp} Ki={self.Ki} Kd={self.Kd} dead_zone={self.dead_zone}px")
+        rospy.loginfo(f"Speed: base={self.base_speed} max={self.max_speed} min={self.min_speed}")
+
+    def _load_calibration(self, calib_file):
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        if not os.path.exists(calib_file):
+            rospy.logwarn(f"No calibration file at {calib_file}; running without undistort")
+            return
+        try:
+            with open(calib_file, 'r') as f:
+                data = yaml.safe_load(f)
+            self.camera_matrix = np.array(
+                data['camera_matrix']['data'], dtype=np.float64).reshape(3, 3)
+            self.dist_coeffs = np.array(
+                data['distortion_coefficients']['data'], dtype=np.float64)
+            rospy.loginfo("Camera calibration loaded")
+        except Exception as e:
+            rospy.logwarn(f"Calibration load error: {e}")
+
+    def _enable_cb(self, msg):
+        self.drive_enabled = msg.data
+        if not self.drive_enabled:
+            self._stop_robot()
+
+    def _frame_is_fresh(self, msg):
+        if self.max_frame_age <= 0.0 or msg.header.stamp == rospy.Time(0):
+            return True
+        age = (rospy.Time.now() - msg.header.stamp).to_sec()
+        if age > self.max_frame_age:
+            rospy.logwarn_throttle(2, f"Skipping stale frame: {age:.2f}s old")
+            return False
+        return True
+
+    def _should_accept_frame(self, msg):
+        _ = msg
+        self._no_frame_warned = True
+        self.frame_count += 1
+        return True
+
+    def _image_cb(self, msg):
+        if not self._should_accept_frame(msg):
+            return
+        self._store_latest_msg(msg, True)
+
+    def _image_cb_raw(self, msg):
+        if not self._should_accept_frame(msg):
+            return
+        self._store_latest_msg(msg, False)
+
+    def _store_latest_msg(self, msg, is_compressed):
+        with self._latest_lock:
+            if self._latest_msg is not None:
+                self._dropped_pending_frames += 1
+            self._latest_msg = msg
+            self._latest_is_compressed = is_compressed
+
+    def _take_latest_msg(self):
+        with self._latest_lock:
+            msg = self._latest_msg
+            is_compressed = self._latest_is_compressed
+            self._latest_msg = None
+        return msg, is_compressed
+
+    def _process_latest_msg(self):
+        msg, is_compressed = self._take_latest_msg()
+        if msg is None:
+            return False
+        if not self._frame_is_fresh(msg):
+            return True
+        try:
+            if is_compressed:
+                np_arr = np.frombuffer(msg.data, np.uint8)
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    self.processed_frame_count += 1
+                    self._process_frame(frame)
+            else:
+                self.processed_frame_count += 1
+                frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+                self._process_frame(frame)
+            rospy.loginfo_throttle(
+                5, f"frames received={self.frame_count} processed={self.processed_frame_count} "
+                   f"dropped_pending={self._dropped_pending_frames}")
+        except Exception as e:
+            if is_compressed:
+                rospy.logwarn_throttle(5, f"Decode error: {e}")
+            else:
+                rospy.logwarn_throttle(5, f"CvBridge: {e}")
+        return True
+
+    def _process_frame(self, frame):
+        if self.finished:
+            self._stop_robot()
+            rospy.loginfo_throttle(5, "Finish marker detected; stopping robot.")
+            return
+        if self.camera_matrix is not None:
+            frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+
+        if self.resize_width > 0 and self.resize_height > 0:
+            frame = cv2.resize(frame, (int(self.resize_width), int(self.resize_height)))
+        h, w = frame.shape[:2]
+
+        publish_debug_frame = self._debug_publish_due()
+        if publish_debug_frame:
+            self._publish_perspective_overlay(frame, w, h)
+        bird = self._perspective_transform(frame, w, h)
+        hsv = cv2.cvtColor(bird, cv2.COLOR_BGR2HSV)
+        yellow_mask = self._build_mask(hsv, self.yellow_low, self.yellow_high)
+        white_mask = self._build_white_mask(hsv)
+
+        bh, bw = bird.shape[:2]
+        finish_info = self._detect_finish_marker(bird)
+        detection = self._detect_scanlines(yellow_mask, white_mask, bw, bh)
+        detection['finish'] = finish_info
+        detection['source'] = 'NEAR'
+        lane_center = detection['lane_center']
+        confidence = detection['confidence']
+        state = detection['state']
+
+        if finish_info['detected']:
+            self.finish_detected_frames += 1
+        else:
+            self.finish_detected_frames = 0
+        finish_info['frames'] = self.finish_detected_frames
+
+        if (self.finish_enabled and self.finish_stop_after_detect and
+                self.finish_detected_frames >= self.finish_required_frames):
+            self.finished = True
+            finish_info['finished'] = True
+            if not self.finish_logged:
+                rospy.loginfo("Finish marker detected; stopping robot.")
+                self.finish_logged = True
+            if self.drive_enabled:
+                self._stop_robot()
+            self.error_pub.publish(Float32(data=float(self.error_prev)))
+            self._publish_debug(bird, yellow_mask, white_mask, detection, bw, bh,
+                                self.error_prev, self.error_smooth, 0.0, 0.0,
+                                publish_debug_frame)
+            return
+
+        if detection['left_found']:
+            self.last_left_cx = detection['left_x']
+        if detection['right_found']:
+            self.last_right_cx = detection['right_x']
+
+        if state == 'LOST':
+            self.lost_frames += 1
+            error = self.error_prev
+        else:
+            self.lost_frames = 0
+            self.last_lane_center = lane_center
+            error = float(lane_center - (bw // 2))
+            self.error_prev = error
+
+        if self.lost_frames > self.max_lost_frames:
+            far_result = self._try_far_fallback(frame, w, h)
+            if far_result is not None:
+                bird = far_result['bird']
+                yellow_mask = far_result['yellow_mask']
+                white_mask = far_result['white_mask']
+                detection = far_result['detection']
+                detection['finish'] = finish_info
+                bh, bw = bird.shape[:2]
+                error = float(detection['lane_center'] - (bw // 2))
+                self.error_prev = error
+                self.error_smooth = self.ema_alpha * error + (1.0 - self.ema_alpha) * self.error_smooth
+                smoothed = 0.0 if abs(self.error_smooth) < self.dead_zone else self.error_smooth
+                pid_error = smoothed * self._turn_gain_for_detection(detection)
+                angular = float(np.clip(self._pid(pid_error), -self.max_angular, self.max_angular))
+                linear = self._adaptive_speed(abs(smoothed))
+                if self.angular_coupling > 0.0 and self.max_angular > 0.0:
+                    coupling = 1.0 - self.angular_coupling * abs(angular) / self.max_angular
+                    linear = max(linear * coupling, self.min_speed)
+                self.last_lane_center = detection['lane_center']
+            else:
+                self.error_integral = 0.0
+                self.pid_error_prev = 0.0
+                linear = self._lost_lane_linear_speed()
+                angular = 0.0
+                detection['source'] = 'LOST'
+            self._log_lane_source_change(detection)
+            if self.drive_enabled:
+                self._publish_cmd(linear, angular)
+            self.error_pub.publish(Float32(data=float(self.error_prev)))
+            self._publish_debug(bird, yellow_mask, white_mask, detection, bw, bh,
+                                self.error_prev, self.error_smooth, linear, angular,
+                                publish_debug_frame)
+            if far_result is not None:
+                rospy.logwarn_throttle(
+                    2,
+                    f"Lane lost for {self.lost_frames} frames; "
+                    f"source=FAR_FALLBACK conf={detection['confidence']:.2f}.")
+            elif self.drive_straight_when_lost:
+                rospy.logwarn_throttle(
+                    2,
+                    f"Lane lost for {self.lost_frames} frames; driving straight.")
+            else:
+                rospy.logwarn_throttle(
+                    2,
+                    f"Lane lost for {self.lost_frames} frames; stopping.")
+            return
+
+        self.error_smooth = self.ema_alpha * error + (1.0 - self.ema_alpha) * self.error_smooth
+        smoothed = 0.0 if abs(self.error_smooth) < self.dead_zone else self.error_smooth
+        pid_error = smoothed * self._turn_gain_for_detection(detection)
+        angular = float(np.clip(self._pid(pid_error), -self.max_angular, self.max_angular))
+        linear = self._adaptive_speed(abs(smoothed))
+
+        if state == 'LOST' or (confidence < 0.35 and
+                               not self._is_single_line_detection(detection)):
+            linear = self.min_speed
+        if self.angular_coupling > 0.0 and self.max_angular > 0.0:
+            coupling = 1.0 - self.angular_coupling * abs(angular) / self.max_angular
+            linear = max(linear * coupling, self.min_speed)
+
+        if self.drive_enabled:
+            self._publish_cmd(linear, angular)
+        else:
+            linear = 0.0
+            angular = 0.0
+        self._log_lane_source_change(detection)
+        self.error_pub.publish(Float32(data=float(error)))
+        self._publish_debug(bird, yellow_mask, white_mask, detection, bw, bh,
+                            error, self.error_smooth, linear, angular,
+                            publish_debug_frame)
+
+    def _build_mask(self, hsv, low, high):
+        ksize = max(1, int(self.morph_kernel_size))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+        mask = cv2.inRange(hsv, low, high)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        return mask
+
+    def _build_white_mask(self, hsv):
+        mask = self._build_mask(hsv, self.white_low, self.white_high)
+        ksize = max(1, int(self.white_morph_kernel_size))
+        if ksize > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        iterations = max(0, int(self.white_dilate_iterations))
+        if iterations > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            mask = cv2.dilate(mask, kernel, iterations=iterations)
+        return mask
+
+    def _perspective_transform(self, img, w, h, source='near'):
+        src = self._perspective_src_points(w, h, source)
+        m = self.far_dst_margin if source == 'far' else self.dst_margin
+        dst = np.float32([
+            [w * m, 0], [w * (1 - m), 0],
+            [w * m, h], [w * (1 - m), h],
+        ])
+        return cv2.warpPerspective(img, cv2.getPerspectiveTransform(src, dst), (w, h))
+
+    def _perspective_src_points(self, w, h, source='near'):
+        if source == 'far':
+            src_tl = self.far_src_tl
+            src_tr = self.far_src_tr
+            src_bl = self.far_src_bl
+            src_br = self.far_src_br
+        else:
+            src_tl = self.src_tl
+            src_tr = self.src_tr
+            src_bl = self.src_bl
+            src_br = self.src_br
+        return np.float32([
+            [w * src_tl[0], h * src_tl[1]],
+            [w * src_tr[0], h * src_tr[1]],
+            [w * src_bl[0], h * src_bl[1]],
+            [w * src_br[0], h * src_br[1]],
+        ])
+
+    def _try_far_fallback(self, frame, w, h):
+        if not self.far_enabled:
+            return None
+        bird = self._perspective_transform(frame, w, h, 'far')
+        hsv = cv2.cvtColor(bird, cv2.COLOR_BGR2HSV)
+        yellow_mask = self._build_mask(hsv, self.yellow_low, self.yellow_high)
+        white_mask = self._build_white_mask(hsv)
+        bh, bw = bird.shape[:2]
+        detection = self._detect_scanlines(yellow_mask, white_mask, bw, bh)
+        detection['source'] = 'FAR_FALLBACK'
+        if detection['state'] == 'LOST' or detection['confidence'] < self.far_min_confidence:
+            return None
+        return {
+            'bird': bird,
+            'yellow_mask': yellow_mask,
+            'white_mask': white_mask,
+            'detection': detection,
+        }
+
+    def _publish_perspective_overlay(self, frame, w, h):
+        if (not self.debug_perspective or
+                self.perspective_pub.get_num_connections() <= 0):
+            return
+        try:
+            overlay = frame.copy()
+            pts = self._perspective_src_points(w, h).astype(np.int32)
+            polygon = pts.reshape((-1, 1, 2))
+            fill = overlay.copy()
+            cv2.fillPoly(fill, [polygon], (0, 180, 255))
+            cv2.addWeighted(fill, 0.22, overlay, 0.78, 0, overlay)
+            near_active = self.active_lane_source in ('INIT', 'NEAR')
+            far_active = self.active_lane_source == 'FAR_FALLBACK'
+            lost_active = self.active_lane_source == 'LOST'
+            cv2.polylines(overlay, [polygon], True, (0, 255, 255),
+                          4 if near_active else 1)
+
+            if self.far_enabled:
+                far_pts = self._perspective_src_points(w, h, 'far').astype(np.int32)
+                far_polygon = far_pts.reshape((-1, 1, 2))
+                cv2.polylines(overlay, [far_polygon], True, (255, 160, 0),
+                              4 if far_active else 1)
+                for point in far_pts:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(overlay, (x, y), 4, (255, 160, 0), -1)
+
+            labels = ('TL', 'TR', 'BL', 'BR')
+            for label, point in zip(labels, pts):
+                x, y = int(point[0]), int(point[1])
+                cv2.circle(overlay, (x, y), 5, (0, 0, 255), -1)
+                cv2.putText(overlay, label, (x + 6, y - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            cv2.putText(overlay,
+                        f"tl={self.src_tl} tr={self.src_tr}",
+                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+            cv2.putText(overlay,
+                        f"bl={self.src_bl} br={self.src_br} dst_margin={self.dst_margin}",
+                        (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+            if self.far_enabled:
+                cv2.putText(overlay,
+                            f"far tl={self.far_src_tl} tr={self.far_src_tr}",
+                            (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 160, 0), 2)
+            active_color = (0, 0, 255) if lost_active else ((255, 160, 0) if far_active else (0, 255, 255))
+            cv2.putText(overlay,
+                        f"active={self.active_lane_source}",
+                        (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.65, active_color, 2)
+            self.perspective_pub.publish(self.bridge.cv2_to_imgmsg(overlay, "bgr8"))
+        except Exception as e:
+            rospy.logwarn_throttle(10, f"Perspective overlay error: {e}")
+
+    def _debug_publish_due(self):
+        if self.debug_max_rate <= 0.0:
+            return True
+        now = rospy.Time.now()
+        if self._last_debug_pub_time == rospy.Time(0):
+            self._last_debug_pub_time = now
+            return True
+        period = 1.0 / max(self.debug_max_rate, 0.1)
+        if (now - self._last_debug_pub_time).to_sec() >= period:
+            self._last_debug_pub_time = now
+            return True
+        return False
+
+    def _expected_lane_width(self, bw):
+        if self.expected_lane_width_px > 0:
+            return float(self.expected_lane_width_px)
+        return float(bw) * self.expected_lane_width_ratio
+
+    def _segments_from_band(self, band, color, scanline_index):
+        active = np.count_nonzero(band, axis=0) > 0
+        segments = []
+        start = None
+        for i, is_active in enumerate(active):
+            if is_active and start is None:
+                start = i
+            elif not is_active and start is not None:
+                if i - start >= self.min_segment_width:
+                    segments.append(self._segment(band, start, i - 1, color, scanline_index))
+                start = None
+        if start is not None and len(active) - start >= self.min_segment_width:
+            segments.append(self._segment(band, start, len(active) - 1, color, scanline_index))
+        return segments
+
+    def _segment(self, band, start, end, color, scanline_index):
+        pixel_count = int(np.count_nonzero(band[:, start:end + 1]))
+        return {
+            'start': int(start),
+            'end': int(end),
+            'x_start': int(start),
+            'x_end': int(end),
+            'center': int((start + end) / 2),
+            'center_x': int((start + end) / 2),
+            'width': int(end - start + 1),
+            'pixel_count': pixel_count,
+            'color': color,
+            'scanline_index': int(scanline_index),
+        }
+
+    def _merge_close_segments(self, segments, min_gap_px):
+        if len(segments) < 2 or min_gap_px <= 0:
+            return segments
+
+        merged = []
+        current = dict(sorted(segments, key=lambda s: s['start'])[0])
+        for seg in sorted(segments, key=lambda s: s['start'])[1:]:
+            gap = int(seg['start']) - int(current['end'])
+            if gap <= min_gap_px:
+                current['end'] = int(max(current['end'], seg['end']))
+                current['x_end'] = int(max(current['x_end'], seg['x_end']))
+                current['start'] = int(min(current['start'], seg['start']))
+                current['x_start'] = int(min(current['x_start'], seg['x_start']))
+                current['center'] = int((current['start'] + current['end']) / 2)
+                current['center_x'] = current['center']
+                current['width'] = int(current['end'] - current['start'] + 1)
+                current['pixel_count'] = int(current['pixel_count'] + seg['pixel_count'])
+            else:
+                merged.append(current)
+                current = dict(seg)
+        merged.append(current)
+        return merged
+
+    def _yellow_fence_gap(self, bw):
+        if self.yellow_fence_gap_px > 0:
+            return int(self.yellow_fence_gap_px)
+        return int(round(float(bw) * float(self.yellow_fence_gap_ratio)))
+
+    def _scanline_pair(self, a, b, bw, idx):
+        if a is b:
+            return None
+        left_seg, right_seg = (a, b) if a['center_x'] <= b['center_x'] else (b, a)
+        left_x = int(left_seg['x_end'])
+        right_x = int(right_seg['x_start'])
+        if right_x <= left_x:
+            return None
+
+        expected_width = self._expected_lane_width(bw)
+        image_center = bw / 2.0
+        width = float(right_x - left_x)
+        if width < max(10.0, bw * 0.04) or width > bw * 0.98:
+            return None
+
+        center = (left_x + right_x) / 2.0
+        previous_left = self.last_scanline_left.get(idx, self.last_left_cx)
+        previous_right = self.last_scanline_right.get(idx, self.last_right_cx)
+        reference_center = self.last_lane_center if self.last_lane_center is not None else image_center
+
+        width_error = min(abs(width - expected_width) / max(expected_width, 1.0), 1.5)
+        width_score = max(0.0, 1.0 - width_error / 1.5)
+        image_score = max(0.0, 1.0 - abs(center - image_center) / max(image_center, 1.0))
+        prev_center_score = max(0.0, 1.0 - abs(center - reference_center) /
+                                max(float(self.max_center_jump_px), 1.0))
+
+        memory_scores = []
+        if previous_left is not None:
+            memory_scores.append(max(0.0, 1.0 - abs(left_x - previous_left) /
+                                     max(expected_width * 0.5, 1.0)))
+        if previous_right is not None:
+            memory_scores.append(max(0.0, 1.0 - abs(right_x - previous_right) /
+                                     max(expected_width * 0.5, 1.0)))
+        memory_score = float(np.mean(memory_scores)) if memory_scores else 0.55
+
+        quality_scale = max(float(self.min_segment_width * max(1, int(self.scanline_band_height))), 1.0)
+        quality = min(1.0, min(a['pixel_count'], b['pixel_count']) / quality_scale)
+
+        mixed = a['color'] != b['color']
+        if mixed:
+            color_score = 1.0
+            pair_mode = 'white_yellow'
+        elif a['color'] == 'yellow':
+            color_score = 0.62
+            pair_mode = 'yellow_only'
+        else:
+            color_score = 0.40
+            pair_mode = 'white_only'
+
+        score = (0.24 * image_score + 0.24 * width_score +
+                 0.22 * prev_center_score + 0.14 * memory_score +
+                 0.10 * color_score + 0.06 * quality)
+
+        min_width = bw * self.min_lane_width_ratio
+        max_width = bw * self.max_lane_width_ratio
+        if self.strict_lane_width and (width < min_width or width > max_width):
+            return None
+        if width < min_width or width > max_width:
+            score *= 0.70
+        if max(a['width'], b['width']) > max(expected_width * 0.50, bw * 0.25):
+            score *= 0.65
+        if ((left_x < image_center and right_x < image_center) or
+                (left_x > image_center and right_x > image_center)):
+            score *= 0.78
+        if self.last_lane_center is not None:
+            jump = abs(center - self.last_lane_center)
+            if jump > self.max_center_jump_px:
+                score *= max(0.55, self.max_center_jump_px / max(jump, 1.0))
+
+        return {
+            'left_x': int(left_x),
+            'right_x': int(right_x),
+            'center_x': float(center),
+            'width': int(round(width)),
+            'confidence': float(max(0.05, min(score, 1.0))),
+            'left_segment': left_seg,
+            'right_segment': right_seg,
+            'left_color': left_seg['color'],
+            'right_color': right_seg['color'],
+            'pair_mode': pair_mode,
+            'mixed': mixed,
+        }
+
+    def _choose_scanline_pair(self, yellow_segments, white_segments, bw, idx):
+        mode = self.lane_color_mode
+        yellow_pairs = []
+        mixed_pairs = []
+        white_pairs = []
+
+        for i, seg_a in enumerate(yellow_segments):
+            for seg_b in yellow_segments[i + 1:]:
+                pair = self._scanline_pair(seg_a, seg_b, bw, idx)
+                if pair is not None:
+                    yellow_pairs.append(pair)
+
+        for yellow in yellow_segments:
+            for white in white_segments:
+                pair = self._scanline_pair(yellow, white, bw, idx)
+                if pair is not None:
+                    mixed_pairs.append(pair)
+
+        for i, seg_a in enumerate(white_segments):
+            for seg_b in white_segments[i + 1:]:
+                pair = self._scanline_pair(seg_a, seg_b, bw, idx)
+                if pair is not None:
+                    white_pairs.append(pair)
+
+        best_mixed = max(mixed_pairs, key=lambda p: p['confidence'], default=None)
+        best_yellow = max(yellow_pairs, key=lambda p: p['confidence'], default=None)
+        best_white = max(white_pairs, key=lambda p: p['confidence'], default=None)
+
+        if mode == 'yellow_only':
+            return best_yellow
+        if mode == 'white_yellow':
+            return best_mixed
+
+        candidates = []
+        if best_mixed is not None and best_mixed['confidence'] >= 0.45:
+            candidates.append(best_mixed)
+        if best_yellow is not None:
+            candidates.append(best_yellow)
+        if best_white is not None and not yellow_segments:
+            best_white['confidence'] *= 0.75
+            candidates.append(best_white)
+        if best_mixed is not None and best_mixed not in candidates:
+            candidates.append(best_mixed)
+
+        return max(candidates, key=lambda p: p['confidence'], default=None)
+
+    def _active_mode_for_pair(self, pair):
+        if self.lane_color_mode == 'auto':
+            if pair['mixed']:
+                return 'white_yellow'
+            if pair['pair_mode'] == 'yellow_only':
+                return 'yellow_fallback'
+            return 'white_fallback'
+        return pair['pair_mode']
+
+    def _fallback_mode_for_color(self, color):
+        if self.lane_color_mode == 'auto':
+            return f"{color}_fallback"
+        return f"{color}_single"
+
+    def _choose_single_border(self, yellow_segments, white_segments, bw, idx):
+        segments = []
+        if self.lane_color_mode in ('yellow_only', 'white_yellow', 'auto'):
+            segments.extend(yellow_segments)
+        if self.lane_color_mode in ('white_yellow', 'auto'):
+            segments.extend(white_segments)
+        if not segments:
+            return None
+
+        expected_width = self._expected_lane_width(bw)
+        image_center = bw / 2.0
+        reference_center = self.last_lane_center if self.last_lane_center is not None else image_center
+        best = None
+        for seg in segments:
+            for side in ('left', 'right'):
+                target, edge = self._side_target(side, bw, idx)
+                border_x = seg[edge]
+                center_x = (border_x + expected_width / 2.0
+                            if side == 'left' else border_x - expected_width / 2.0)
+                center_score = max(0.0, 1.0 - abs(center_x - reference_center) /
+                                   max(float(self.max_center_jump_px), 1.0))
+                side_score = max(0.0, 1.0 - abs(border_x - target) /
+                                 max(expected_width * 0.5, 1.0))
+                image_score = max(0.0, 1.0 - abs(center_x - image_center) /
+                                  max(image_center, 1.0))
+                score = 0.45 * center_score + 0.35 * side_score + 0.20 * image_score
+                if side == 'left' and border_x > image_center and self.last_left_cx is None:
+                    score *= 0.65
+                if side == 'right' and border_x < image_center and self.last_right_cx is None:
+                    score *= 0.65
+                if best is None or score > best['score']:
+                    best = {
+                        'segment': seg,
+                        'side': side,
+                        'edge': edge,
+                        'border_x': int(border_x),
+                        'center_x': float(center_x),
+                        'score': float(score),
+                    }
+        return best
+
+    def _side_target(self, side, bw, idx):
+        expected_width = self._expected_lane_width(bw)
+        if side == 'left':
+            previous = self.last_scanline_left.get(idx, self.last_left_cx)
+            fallback = (self.last_lane_center - expected_width / 2.0
+                        if self.last_lane_center is not None else bw * 0.25)
+            return previous if previous is not None else fallback, 'end'
+        previous = self.last_scanline_right.get(idx, self.last_right_cx)
+        fallback = (self.last_lane_center + expected_width / 2.0
+                    if self.last_lane_center is not None else bw * 0.75)
+        return previous if previous is not None else fallback, 'start'
+
+    def _detect_scanlines(self, yellow_mask, white_mask, bw, bh):
+        roi_top = int(bh * self.roi_top)
+        roi_bot = int(bh * self.roi_bot)
+        roi_top = max(0, min(roi_top, bh - 1))
+        roi_bot = max(roi_top + 1, min(roi_bot, bh))
+        band_h = max(1, int(self.scanline_band_height))
+        expected_width = self._expected_lane_width(bw)
+        weighted_centers = []
+        lane_widths = []
+        scanlines = []
+        left_points = []
+        right_points = []
+
+        for idx, ratio in enumerate(self.scanline_ratios):
+            y = roi_top + int((roi_bot - roi_top) * float(ratio))
+            y0 = max(roi_top, y - band_h // 2)
+            y1 = min(roi_bot, y0 + band_h)
+            raw_yellow_segments = self._segments_from_band(yellow_mask[y0:y1, :], 'yellow', idx)
+            yellow_fence_gap = self._yellow_fence_gap(bw)
+            yellow_segments = self._merge_close_segments(raw_yellow_segments, yellow_fence_gap)
+            white_segments = self._segments_from_band(white_mask[y0:y1, :], 'white', idx)
+
+            pair = self._choose_scanline_pair(yellow_segments, white_segments, bw, idx)
+            left_x = right_x = center_x = None
+            confidence = 0.0
+            lane_width = None
+            left_color = right_color = None
+            active_mode = None
+            if pair is not None:
+                left_x = pair['left_x']
+                right_x = pair['right_x']
+                center_x = pair['center_x']
+                confidence = pair['confidence']
+                lane_width = pair['width']
+                left_color = pair['left_color']
+                right_color = pair['right_color']
+                active_mode = self._active_mode_for_pair(pair)
+                self.last_scanline_left[idx] = left_x
+                self.last_scanline_right[idx] = right_x
+                left_points.append(left_x)
+                right_points.append(right_x)
+            else:
+                single = self._choose_single_border(yellow_segments, white_segments, bw, idx)
+                if single is not None and single['side'] == 'left':
+                    left_x = int(single['border_x'])
+                    center_x = left_x + expected_width / 2.0
+                    confidence = 0.32 * max(0.4, single['score'])
+                    left_color = single['segment']['color']
+                    active_mode = self._fallback_mode_for_color(left_color)
+                    self.last_scanline_left[idx] = left_x
+                    left_points.append(left_x)
+                elif single is not None:
+                    right_x = int(single['border_x'])
+                    center_x = right_x - expected_width / 2.0
+                    confidence = 0.32 * max(0.4, single['score'])
+                    right_color = single['segment']['color']
+                    active_mode = self._fallback_mode_for_color(right_color)
+                    self.last_scanline_right[idx] = right_x
+                    right_points.append(right_x)
+
+            weight = (self.scanline_weights[idx] if idx < len(self.scanline_weights)
+                      else max(0.2, 1.0 - 0.2 * idx))
+            if center_x is not None:
+                weighted_centers.append((center_x, weight * confidence))
+                if lane_width is not None:
+                    lane_widths.append(lane_width)
+            scanlines.append({
+                'y': y,
+                'y0': y0,
+                'y1': y1,
+                'left_x': left_x,
+                'right_x': right_x,
+                'left_color': left_color,
+                'right_color': right_color,
+                'center_x': int(round(center_x)) if center_x is not None else None,
+                'yellow_segments': yellow_segments,
+                'raw_yellow_segments': raw_yellow_segments,
+                'yellow_fence_gap': yellow_fence_gap,
+                'white_segments': white_segments,
+                'active_mode': active_mode,
+            })
+
+        if weighted_centers:
+            total_weight = sum(w for _, w in weighted_centers)
+            lane_center = sum(c * w for c, w in weighted_centers) / max(total_weight, 1e-9)
+            confidence = min(1.0, total_weight / max(sum(self.scanline_weights[:len(self.scanline_ratios)]), 1e-9))
+            left_found = len(left_points) > 0
+            right_found = len(right_points) > 0
+            if left_found and right_found:
+                state = 'BOTH'
+            elif left_found:
+                state = 'LEFT'
+            else:
+                state = 'RIGHT'
+            avg_left = float(np.mean(left_points)) if left_points else None
+            avg_right = float(np.mean(right_points)) if right_points else None
+            lane_center = self._apply_lane_margin(lane_center, avg_left, avg_right)
+            lane_width = int(round(np.mean(lane_widths))) if lane_widths else None
+            if self.last_lane_center is not None:
+                jump = abs(lane_center - self.last_lane_center)
+                if jump > self.max_center_jump_px:
+                    confidence *= max(0.50, self.max_center_jump_px / max(jump, 1.0))
+            active_modes = [
+                s['active_mode'] for s in scanlines
+                if s.get('active_mode') is not None and s.get('center_x') is not None
+            ]
+            active_mode = (max(set(active_modes), key=active_modes.count)
+                           if active_modes else self.lane_color_mode)
+            return {
+                'lane_center': int(round(lane_center)),
+                'confidence': float(confidence),
+                'lane_width': lane_width,
+                'left_x': int(round(avg_left)) if avg_left is not None else None,
+                'right_x': int(round(avg_right)) if avg_right is not None else None,
+                'left_found': left_found,
+                'right_found': right_found,
+                'state': state,
+                'active_mode': active_mode,
+                'scanlines': scanlines,
+                'roi_top': roi_top,
+                'roi_bot': roi_bot,
+            }
+
+        return {
+            'lane_center': self.last_lane_center,
+            'confidence': 0.0,
+            'lane_width': None,
+            'left_x': None,
+            'right_x': None,
+            'left_found': False,
+            'right_found': False,
+            'state': 'LOST',
+            'active_mode': 'none',
+            'scanlines': scanlines,
+            'roi_top': roi_top,
+            'roi_bot': roi_bot,
+        }
+
+    def _apply_lane_margin(self, lane_center, left_x, right_x):
+        center = float(lane_center)
+        margin = float(self.lane_margin_px)
+        if left_x is not None and center - left_x < margin:
+            center = left_x + margin
+        if right_x is not None and right_x - center < margin:
+            center = right_x - margin
+        return center
+
+    def _detect_finish_marker(self, bird):
+        h, w = bird.shape[:2]
+        y_start = int(h * self.finish_roi_top)
+        info = {
+            'detected': False,
+            'checked': False,
+            'finished': self.finished,
+            'frames': self.finish_detected_frames,
+            'bbox': None,
+            'contour': None,
+            'roi_top': y_start,
+            'red_mask': None,
+        }
+        if not self.finish_enabled:
+            return info
+
+        hsv = cv2.cvtColor(bird, cv2.COLOR_BGR2HSV)
+        mask1 = cv2.inRange(hsv, self.red_low1, self.red_high1)
+        mask2 = cv2.inRange(hsv, self.red_low2, self.red_high2)
+        red_mask = cv2.bitwise_or(mask1, mask2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+        info['red_mask'] = red_mask
+
+        elapsed = (rospy.Time.now() - self.start_time).to_sec()
+        if elapsed < self.finish_min_run_time:
+            return info
+
+        info['checked'] = True
+        y_start = max(0, min(y_start, h - 1))
+        roi = red_mask[y_start:h, :]
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best = None
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.finish_min_area or area > self.finish_max_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw <= 0 or bh <= 0:
+                continue
+            aspect = float(bw) / float(bh)
+            rect_area = float(bw * bh)
+            fill_ratio = area / max(rect_area, 1.0)
+            if aspect < 0.35 or aspect > 3.0:
+                continue
+            if fill_ratio < 0.35:
+                continue
+
+            contour_abs = contour.copy()
+            contour_abs[:, :, 1] += y_start
+            bbox = (int(x), int(y + y_start), int(bw), int(bh))
+            if best is None or area > best['area']:
+                best = {
+                    'area': float(area),
+                    'bbox': bbox,
+                    'contour': contour_abs,
+                }
+
+        if best is not None:
+            info['detected'] = True
+            info['bbox'] = best['bbox']
+            info['contour'] = best['contour']
+        return info
+
+    def _pid(self, error):
+        now = rospy.Time.now()
+        dt = (now - self.last_time).to_sec()
+        if dt <= 0 or dt > 0.5:
+            dt = 0.033
+        self.error_integral = float(np.clip(
+            self.error_integral + error * dt,
+            -self.integral_limit, self.integral_limit))
+        angular = -(self.Kp * error +
+                    self.Ki * self.error_integral +
+                    self.Kd * (error - self.pid_error_prev) / dt)
+        self.pid_error_prev = error
+        self.last_time = now
+        return angular
+
+    def _adaptive_speed(self, abs_error):
+        if not self.adaptive:
+            return self.base_speed
+        if abs_error < self.slow_thresh:
+            t = abs_error / max(self.slow_thresh, 1e-9)
+            return self.max_speed - t * (self.max_speed - self.base_speed)
+        t = min((abs_error - self.slow_thresh) /
+                max(self.stop_thresh - self.slow_thresh, 1e-9), 1.0)
+        return self.base_speed - t * (self.base_speed - self.min_speed)
+
+    def _turn_gain_for_detection(self, detection):
+        return (float(self.single_line_turn_gain)
+                if self._is_single_line_detection(detection) else 1.0)
+
+    def _is_single_line_detection(self, detection):
+        state = detection.get('state')
+        active_mode = detection.get('active_mode', '')
+        return (
+            state in ('LEFT', 'RIGHT') or
+            active_mode.endswith('_single') or
+            active_mode.endswith('_fallback')
+        )
+
+    def _draw_yellow_fence_debug(self, dbg, scanline):
+        raw_segments = sorted(
+            scanline.get('raw_yellow_segments', []), key=lambda s: s['start'])
+        fence_gap = int(scanline.get('yellow_fence_gap', 0))
+        if fence_gap <= 0:
+            return
+
+        y = int(scanline['y'])
+        y0 = int(scanline['y0'])
+        y1 = int(scanline['y1']) - 1
+        marker_y = max(y0, min(y1, y - 3))
+
+        for seg in raw_segments:
+            cv2.rectangle(dbg, (seg['start'], y0), (seg['end'], y1),
+                          (0, 120, 255), 1)
+
+        for left, right in zip(raw_segments, raw_segments[1:]):
+            gap = int(right['start']) - int(left['end'])
+            close_enough = gap <= fence_gap
+            color = (255, 0, 255) if close_enough else (80, 80, 255)
+            thickness = 2 if close_enough else 1
+            x0 = int(left['end'])
+            x1 = int(right['start'])
+            cv2.line(dbg, (x0, marker_y), (x1, marker_y), color, thickness)
+            cv2.line(dbg, (x0, marker_y - 4), (x0, marker_y + 4), color, thickness)
+            cv2.line(dbg, (x1, marker_y - 4), (x1, marker_y + 4), color, thickness)
+            label = f"{gap}px"
+            if close_enough:
+                label += "<=fence"
+            cv2.putText(dbg, label, (max(0, x0 + 2), max(12, marker_y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
+
+    def _publish_cmd(self, linear, angular):
+        t = Twist()
+        # Camera is rear-mounted: drive backward, flip steering
+        t.linear.x = -max(float(linear), 0.0)
+        t.angular.z = -float(angular)
+        self.cmd_pub.publish(t)
+
+    def _lost_lane_linear_speed(self):
+        if not self.drive_straight_when_lost:
+            return 0.0
+        if self.lost_straight_speed > 0.0:
+            return float(self.lost_straight_speed)
+        return float(self.base_speed)
+
+    def _log_lane_source_change(self, detection):
+        source = detection.get('source', 'NEAR')
+        self.active_lane_source = source
+        if source == self.last_lane_source:
+            return
+
+        message = (
+            f"lane_source {self.last_lane_source} -> {source} "
+            f"state={detection.get('state')} "
+            f"active={detection.get('active_mode')} "
+            f"conf={detection.get('confidence', 0.0):.2f} "
+            f"center={detection.get('lane_center')} "
+            f"lost_frames={self.lost_frames}"
+        )
+        self.last_lane_source = source
+        if source == 'NEAR':
+            rospy.loginfo(message)
+        else:
+            rospy.logwarn(message)
+
+    def _publish_debug(self, bird, yellow_mask, white_mask, detection, bw, bh,
+                       error, smoothed_error, linear, angular,
+                       allow_publish=True):
+        try:
+            publish_mask = (allow_publish and self.debug_mask and
+                            self.mask_pub.get_num_connections() > 0)
+            publish_white = (allow_publish and self.debug_white_mask and
+                             self.white_mask_pub.get_num_connections() > 0)
+            publish_red = (allow_publish and self.finish_enabled and self.debug_mask and
+                           self.red_mask_pub.get_num_connections() > 0)
+            publish_bird = (allow_publish and self.debug_bird and
+                            self.bird_pub.get_num_connections() > 0)
+            publish_debug = (allow_publish and self.debug_img and
+                             self.debug_pub.get_num_connections() > 0)
+
+            if publish_mask:
+                self.mask_pub.publish(self.bridge.cv2_to_imgmsg(yellow_mask, "mono8"))
+            if publish_white:
+                self.white_mask_pub.publish(self.bridge.cv2_to_imgmsg(white_mask, "mono8"))
+            finish_info = detection.get('finish', {})
+            red_mask = finish_info.get('red_mask')
+            if publish_red and red_mask is not None:
+                self.red_mask_pub.publish(self.bridge.cv2_to_imgmsg(red_mask, "mono8"))
+            if publish_bird:
+                self.bird_pub.publish(self.bridge.cv2_to_imgmsg(bird, "bgr8"))
+
+            dbg = None
+            if publish_debug or self.show_windows:
+                dbg = bird.copy()
+                roi_top = detection.get('roi_top', int(bh * self.roi_top))
+                roi_bot = detection.get('roi_bot', int(bh * self.roi_bot))
+                img_center = bw // 2
+                lane_center = detection['lane_center']
+                cv2.rectangle(dbg, (0, roi_top), (bw - 1, roi_bot - 1), (80, 80, 255), 2)
+                cv2.line(dbg, (img_center, 0), (img_center, bh), (0, 255, 0), 2)
+                finish_roi_top = finish_info.get('roi_top')
+                if finish_roi_top is not None:
+                    cv2.rectangle(dbg, (0, int(finish_roi_top)), (bw - 1, bh - 1),
+                                  (0, 0, 180), 1)
+
+                for scanline in detection.get('scanlines', []):
+                    y = scanline['y']
+                    cv2.line(dbg, (0, y), (bw, y), (180, 180, 0), 1)
+                    self._draw_yellow_fence_debug(dbg, scanline)
+                    for seg in scanline.get('yellow_segments', []):
+                        cv2.rectangle(dbg, (seg['start'], scanline['y0']),
+                                      (seg['end'], scanline['y1'] - 1), (0, 180, 180), 1)
+                    for seg in scanline.get('white_segments', []):
+                        cv2.rectangle(dbg, (seg['start'], scanline['y0']),
+                                      (seg['end'], scanline['y1'] - 1), (220, 220, 220), 1)
+                    if scanline['left_x'] is not None:
+                        color = ((0, 255, 255) if scanline.get('left_color') == 'yellow'
+                                 else (255, 255, 255))
+                        cv2.circle(dbg, (scanline['left_x'], y), 5, color, -1)
+                    if scanline['right_x'] is not None:
+                        color = ((0, 255, 255) if scanline.get('right_color') == 'yellow'
+                                 else (255, 255, 255))
+                        cv2.circle(dbg, (scanline['right_x'], y), 5, color, -1)
+                    if scanline['center_x'] is not None:
+                        cv2.circle(dbg, (scanline['center_x'], y), 5, (0, 0, 255), -1)
+
+                if lane_center is not None:
+                    cv2.circle(dbg, (int(lane_center), bh // 2), 9, (0, 0, 255), -1)
+                    cv2.line(dbg, (int(lane_center), 0), (int(lane_center), bh), (0, 0, 255), 2)
+
+                contour = finish_info.get('contour')
+                if contour is not None:
+                    cv2.drawContours(dbg, [contour], -1, (0, 0, 255), 2)
+                bbox = finish_info.get('bbox')
+                if bbox is not None:
+                    x, y, box_w, box_h = bbox
+                    cv2.rectangle(dbg, (x, y), (x + box_w, y + box_h), (0, 0, 255), 2)
+
+                cv2.putText(dbg,
+                    f"source={detection.get('source', 'NEAR')} mode={self.lane_color_mode} active={detection.get('active_mode')} state={detection['state']} conf={detection['confidence']:.2f}",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(dbg,
+                    f"e={error:.0f}px smooth={smoothed_error:.0f}px lost={self.lost_frames} v={linear:.3f} w={angular:.3f}",
+                    (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(dbg,
+                    f"width={detection['lane_width']} center={lane_center}",
+                    (10, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(dbg,
+                    f"yellow_fence_gap={self._yellow_fence_gap(bw)}px",
+                    (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(dbg,
+                    f"finish={finish_info.get('frames', self.finish_detected_frames)}/{self.finish_required_frames} detected={finish_info.get('detected', False)}",
+                    (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                if self.finished:
+                    cv2.putText(dbg, "FINISHED", (10, 176),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+            if publish_debug and dbg is not None:
+                self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))
+            if self.show_windows:
+                cv2.imshow("lane/bird", bird)
+                cv2.imshow("lane/yellow_mask", yellow_mask)
+                cv2.imshow("lane/white_mask", white_mask)
+                if red_mask is not None:
+                    cv2.imshow("lane/red_mask", red_mask)
+                if dbg is not None:
+                    cv2.imshow("lane/debug", dbg)
+                cv2.waitKey(1)
+        except Exception as e:
+            rospy.logwarn_throttle(10, f"Debug error: {e}")
+
+    def _stop_robot(self):
+        for _ in range(3):
+            self._publish_cmd(0.0, 0.0)
+
+    def _shutdown(self):
+        rospy.loginfo("Shutdown: stopping robot")
+        self._stop_robot()
+        if self.show_windows:
+            cv2.destroyAllWindows()
+
+    def spin(self):
+        rate = rospy.Rate(self.processing_rate)
+        while not rospy.is_shutdown():
+            self._process_latest_msg()
+            if not self._no_frame_warned:
+                elapsed = (rospy.Time.now() - self._no_frame_start).to_sec()
+                if elapsed > 3.0:
+                    topic = self.compressed_topic if self.use_compressed else self.image_topic
+                    rospy.logwarn_throttle(
+                        2,
+                        f"No camera frames received for {elapsed:.0f}s. Expected topic: {topic}")
+            rate.sleep()
+
+
+if __name__ == '__main__':
+    try:
+        LaneFollower().spin()
+    except rospy.ROSInterruptException:
+        pass

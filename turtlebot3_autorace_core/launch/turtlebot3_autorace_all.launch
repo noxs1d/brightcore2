@@ -1,0 +1,103 @@
+<launch>
+  <!-- ============================================================
+       All-in-one launch: runs the full AutoRace pipeline on the Pi.
+       Camera → Extrinsic → Lane Detect → Lane Control
+       (image_proc rectification skipped to save CPU)
+       ============================================================ -->
+
+  <!-- ==================== 1. CAMERA (raspicam_node) ==================== -->
+  <node pkg="raspicam_node" type="raspicam_node" name="raspicam_node" output="screen">
+    <param name="camera_info_url" value="package://raspicam_node/camera_info/camerav2_410x308.yaml"/>
+    <param name="width" value="320"/>
+    <param name="height" value="240"/>
+    <param name="framerate" value="30"/>
+    <param name="enable_raw" value="true"/>
+    <param name="enable_imv" value="false"/>
+    <param name="camera_frame_id" value="raspicam"/>
+    <param name="vflip" value="true"/>
+    <param name="hflip" value="true"/>
+    <!-- Publish directly as the topic the extrinsic nodes expect -->
+    <remap from="/raspicam_node/image" to="/camera/image_rect_color"/>
+    <remap from="/raspicam_node/image/compressed" to="/camera/image_rect_color/compressed"/>
+    <remap from="/raspicam_node/camera_info" to="/camera/camera_info"/>
+  </node>
+
+  <!-- ==================== 2. EXTRINSIC CALIBRATION ==================== -->
+  <group ns="camera">
+    <!-- Compensation of camera image -->
+    <node pkg="turtlebot3_autorace_camera" type="image_compensation"
+          name="image_compensation" output="screen">
+      <rosparam command="load"
+                file="$(find turtlebot3_autorace_camera)/calibration/extrinsic_calibration/compensation.yaml"/>
+      <param name="/is_extrinsic_camera_calibration_mode" value="False"/>
+      <remap from="/camera/image_input" to="/camera/image_rect_color"/>
+      <remap from="/camera/image_input/compressed" to="/camera/image_rect_color/compressed"/>
+      <remap from="/camera/image_output" to="/camera/image_compensated"/>
+      <remap from="/camera/image_output/compressed" to="/camera/image_compensated/compressed"/>
+    </node>
+
+    <!-- Bird's eye view projection -->
+    <node pkg="turtlebot3_autorace_camera" type="image_projection"
+          name="image_projection" output="screen">
+      <rosparam command="load"
+                file="$(find turtlebot3_autorace_camera)/calibration/extrinsic_calibration/projection.yaml"/>
+      <param name="/is_extrinsic_camera_calibration_mode" value="False"/>
+      <remap from="/camera/image_input" to="/camera/image_rect_color"/>
+      <remap from="/camera/image_input/compressed" to="/camera/image_rect_color/compressed"/>
+      <remap from="/camera/image_output" to="/camera/image_projected"/>
+      <remap from="/camera/image_output/compressed" to="/camera/image_projected/compressed"/>
+      <remap from="/camera/image_calib" to="/camera/image_extrinsic_calib"/>
+      <remap from="/camera/image_calib/compressed" to="/camera/image_extrinsic_calib/compressed"/>
+    </node>
+
+    <!-- Compensation of projected image -->
+    <node pkg="turtlebot3_autorace_camera" type="image_compensation"
+          name="image_compensation_projection" output="screen">
+      <rosparam command="load"
+                file="$(find turtlebot3_autorace_camera)/calibration/extrinsic_calibration/compensation.yaml"/>
+      <param name="/is_extrinsic_camera_calibration_mode" value="False"/>
+      <remap from="/camera/image_input" to="/camera/image_projected"/>
+      <remap from="/camera/image_input/compressed" to="/camera/image_projected/compressed"/>
+      <remap from="/camera/image_output" to="/camera/image_projected_compensated"/>
+      <remap from="/camera/image_output/compressed" to="/camera/image_projected_compensated/compressed"/>
+    </node>
+  </group>
+
+  <!-- ==================== 3. LANE DETECTION ==================== -->
+  <node pkg="turtlebot3_autorace_detect" type="detect_lane" name="detect_lane" output="screen">
+    <rosparam command="load" file="$(find turtlebot3_autorace_detect)/param/lane/lane.yaml"/>
+    <param name="is_detection_calibration_mode" value="False"/>
+    <param name="use_white_lane_detection" value="False"/>
+    <param name="debug_publish_masks" value="False"/>
+    <param name="debug_route_log" value="True"/>
+    <param name="enforce_circle_lap" value="True"/>
+    <param name="use_odom_route_state" value="True"/>
+    <param name="circle_min_odom_distance_before_entry" value="1.0"/>
+    <param name="circle_lap_min_yaw" value="5.35"/>
+    <param name="post_circle_required_turn_segments" value="2"/>
+    <param name="parking_pair_required" value="8"/>
+    <param name="parking_straight_heading_max" value="35.0"/>
+    <param name="parking_exit_heading_min" value="45.0"/>
+    <param name="parking_min_hold_frames" value="32"/>
+    <param name="parking_exit_confirm_frames" value="4"/>
+    <remap from="/detect/image_input" to="/camera/image_projected_compensated"/>
+    <remap from="/detect/image_input/compressed" to="/camera/image_projected_compensated/compressed"/>
+    <remap from="/detect/image_output" to="/detect/image_lane"/>
+    <remap from="/detect/image_output/compressed" to="/detect/image_lane/compressed"/>
+    <remap from="/detect/image_output_sub1" to="/detect/image_white_lane_marker"/>
+    <remap from="/detect/image_output_sub1/compressed" to="/detect/image_white_lane_marker/compressed"/>
+    <remap from="/detect/image_output_sub2" to="/detect/image_yellow_lane_marker"/>
+    <remap from="/detect/image_output_sub2/compressed" to="/detect/image_yellow_lane_marker/compressed"/>
+  </node>
+
+  <!-- ==================== 4. LANE CONTROL ==================== -->
+  <node pkg="turtlebot3_autorace_driving" type="control_lane" name="control_lane" output="screen">
+    <param name="straight_hold_vel" value="0.09"/>
+    <param name="straight_hold_kp" value="0.0010"/>
+    <param name="straight_hold_kd" value="0.0015"/>
+    <param name="straight_hold_deadband" value="35.0"/>
+    <param name="straight_hold_max_ang" value="0.22"/>
+    <remap from="/control/lane" to="/detect/lane"/>
+    <remap from="/control/cmd_vel" to="/cmd_vel"/>
+  </node>
+</launch>
