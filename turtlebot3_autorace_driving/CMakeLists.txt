@@ -40,6 +40,7 @@ catkin_install_python(PROGRAMS
   nodes/control_lane
   nodes/control_moving
   nodes/lane_follower_scanline
+  scripts/tune_lane_follower.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -47,7 +48,7 @@ install(DIRECTORY launch
 	DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
-install(DIRECTORY param calibration
+install(DIRECTORY param calibration scripts
 	DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 

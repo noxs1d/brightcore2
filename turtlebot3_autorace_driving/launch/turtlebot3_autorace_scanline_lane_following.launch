@@ -11,12 +11,13 @@
   <arg name="resize_height" default="0" doc="resize frames before processing; 0 keeps camera size"/>
   <arg name="processing_rate" default="15.0"/>
   <arg name="process_every_n_frames" default="1"/>
-  <arg name="max_frame_age" default="0.0"/>
-  <arg name="base_linear" default="0.01"/>
-  <arg name="max_linear" default="0.13"/>
-  <arg name="min_linear" default="0.095"/>
-  <arg name="max_angular" default="1.3"/>
+  <arg name="max_frame_age" default="0.30"/>
+  <arg name="base_linear" default="0.06"/>
+  <arg name="max_linear" default="0.08"/>
+  <arg name="min_linear" default="0.05"/>
+  <arg name="max_angular" default="1.5"/>
   <arg name="enabled" default="true"/>
+  <arg name="tuned_file" default="" doc="optional YAML with tuned overrides (from Optuna study)"/>
 
   <env name="TURTLEBOT3_MODEL" value="$(arg model)"/>
 
@@ -25,6 +26,7 @@
         name="lane_follower_scanline"
         output="screen">
     <rosparam file="$(find turtlebot3_autorace_driving)/param/lane_follower_scanline.yaml" command="load"/>
+    <rosparam if="$(eval tuned_file != '')" file="$(arg tuned_file)" command="load"/>
 
     <param name="use_compressed" value="$(arg use_compressed)"/>
     <param if="$(eval mode == 'action')" name="enabled" value="$(arg enabled)"/>

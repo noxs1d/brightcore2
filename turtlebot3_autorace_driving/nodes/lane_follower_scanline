@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import collections
 import os
 import threading
 
@@ -52,6 +53,14 @@ class LaneFollower:
         self._latest_is_compressed = True
         self._dropped_pending_frames = 0
         self._last_debug_pub_time = rospy.Time(0)
+        # Memory of the most recently published command - used by the LOST
+        # branch to keep turning in the same direction (with decay) when the
+        # lane disappears in the middle of a sharp curve.
+        self.last_angular_cmd = 0.0
+        self.last_linear_cmd = 0.0
+        # Anti-loop oscillation detection: keep sign of the last few angular
+        # commands. If signs flip too often, damp the magnitude.
+        self._angular_sign_history = collections.deque(maxlen=8)
 
         self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
         self.error_pub = rospy.Publisher('/lane_error', Float32, queue_size=1)
@@ -61,7 +70,7 @@ class LaneFollower:
             self.perspective_pub = rospy.Publisher('/lane/perspective_overlay', Image, queue_size=1)
         if self.debug_mask:
             self.mask_pub = rospy.Publisher('/lane/yellow_mask', Image, queue_size=1)
-        if self.debug_white_mask:
+        if self.debug_white_mask and self.lane_color_mode != 'yellow_only':
             self.white_mask_pub = rospy.Publisher('/lane/white_mask', Image, queue_size=1)
         if self.finish_enabled and self.debug_mask:
             self.red_mask_pub = rospy.Publisher('/lane/red_mask', Image, queue_size=1)
@@ -166,9 +175,17 @@ class LaneFollower:
         self.white_morph_kernel_size = rospy.get_param('~detection/white_morph_kernel_size', 7)
         self.white_dilate_iterations = rospy.get_param('~detection/white_dilate_iterations', 1)
         self.enable_anti_loop = rospy.get_param('~control/enable_anti_loop', False)
+        self.anti_loop_flip_threshold = int(rospy.get_param('~control/anti_loop_flip_threshold', 5))
+        self.anti_loop_damping = float(rospy.get_param('~control/anti_loop_damping', 0.5))
         self.single_line_turn_gain = rospy.get_param('~control/single_line_turn_gain', 1.5)
         self.drive_straight_when_lost = rospy.get_param('~control/drive_straight_when_lost', True)
         self.lost_straight_speed = rospy.get_param('~control/lost_straight_speed', 0.0)
+        # When the lane is lost and far-fallback fails, keep applying the last
+        # angular command attenuated by `lost_decay` per frame, and a small
+        # forward speed `lost_min_linear`. Setting drive_straight_when_lost
+        # restores the legacy behaviour (drive straight at base_speed).
+        self.lost_decay = float(rospy.get_param('~control/lost_decay', 0.80))
+        self.lost_min_linear = float(rospy.get_param('~control/lost_min_linear', 0.04))
 
         self.finish_enabled = rospy.get_param('~finish/enabled', True)
         self.finish_min_run_time = rospy.get_param('~finish/min_run_time', 8.0)
@@ -322,7 +339,12 @@ class LaneFollower:
         bird = self._perspective_transform(frame, w, h)
         hsv = cv2.cvtColor(bird, cv2.COLOR_BGR2HSV)
         yellow_mask = self._build_mask(hsv, self.yellow_low, self.yellow_high)
-        white_mask = self._build_white_mask(hsv)
+        # In yellow_only mode the white mask is completely ignored to avoid
+        # spurious "white" detections from real-world reflections and props.
+        if self.lane_color_mode == 'yellow_only':
+            white_mask = np.zeros_like(yellow_mask)
+        else:
+            white_mask = self._build_white_mask(hsv)
 
         bh, bw = bird.shape[:2]
         finish_info = self._detect_finish_marker(bird)
@@ -391,8 +413,20 @@ class LaneFollower:
             else:
                 self.error_integral = 0.0
                 self.pid_error_prev = 0.0
-                linear = self._lost_lane_linear_speed()
-                angular = 0.0
+                if self.drive_straight_when_lost:
+                    linear = self._lost_lane_linear_speed()
+                    angular = 0.0
+                else:
+                    # Decay the last angular command so the robot keeps turning
+                    # in the same direction (with diminishing magnitude) while
+                    # creeping forward slowly. Stop entirely once the residual
+                    # angular drops below a small threshold.
+                    angular = self.last_angular_cmd * self.lost_decay
+                    angular = float(np.clip(angular, -self.max_angular, self.max_angular))
+                    linear = max(self.lost_min_linear, self.min_speed * 0.7)
+                    if abs(angular) < 0.05:
+                        angular = 0.0
+                        linear = 0.0
                 detection['source'] = 'LOST'
             self._log_lane_source_change(detection)
             if self.drive_enabled:
@@ -428,6 +462,8 @@ class LaneFollower:
         if self.angular_coupling > 0.0 and self.max_angular > 0.0:
             coupling = 1.0 - self.angular_coupling * abs(angular) / self.max_angular
             linear = max(linear * coupling, self.min_speed)
+
+        linear, angular = self._apply_anti_loop(linear, angular)
 
         if self.drive_enabled:
             self._publish_cmd(linear, angular)
@@ -493,7 +529,10 @@ class LaneFollower:
         bird = self._perspective_transform(frame, w, h, 'far')
         hsv = cv2.cvtColor(bird, cv2.COLOR_BGR2HSV)
         yellow_mask = self._build_mask(hsv, self.yellow_low, self.yellow_high)
-        white_mask = self._build_white_mask(hsv)
+        if self.lane_color_mode == 'yellow_only':
+            white_mask = np.zeros_like(yellow_mask)
+        else:
+            white_mask = self._build_white_mask(hsv)
         bh, bw = bird.shape[:2]
         detection = self._detect_scanlines(yellow_mask, white_mask, bw, bh)
         detection['source'] = 'FAR_FALLBACK'
@@ -1113,11 +1152,40 @@ class LaneFollower:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
 
     def _publish_cmd(self, linear, angular):
+        linear_f = max(float(linear), 0.0)
+        angular_f = float(angular)
+        self.last_linear_cmd = linear_f
+        self.last_angular_cmd = angular_f
         t = Twist()
         # Camera is rear-mounted: drive backward, flip steering
-        t.linear.x = -max(float(linear), 0.0)
-        t.angular.z = -float(angular)
+        t.linear.x = -linear_f
+        t.angular.z = -angular_f
         self.cmd_pub.publish(t)
+
+    def _apply_anti_loop(self, linear, angular):
+        """Damp angular if its sign flips too often within the recent window."""
+        if not self.enable_anti_loop:
+            return linear, angular
+        if angular == 0.0:
+            return linear, angular
+        sign = 1 if angular > 0.0 else -1
+        history = self._angular_sign_history
+        history.append(sign)
+        if len(history) < history.maxlen:
+            return linear, angular
+        flips = 0
+        prev = None
+        for s in history:
+            if prev is not None and s != prev:
+                flips += 1
+            prev = s
+        if flips >= self.anti_loop_flip_threshold:
+            damping = max(0.0, min(1.0, self.anti_loop_damping))
+            angular *= damping
+            # Keep moving forward a bit faster so we exit the wobble instead of
+            # idling in place.
+            linear = max(linear, self.min_speed * 1.5)
+        return linear, angular
 
     def _lost_lane_linear_speed(self):
         if not self.drive_straight_when_lost:
@@ -1152,7 +1220,11 @@ class LaneFollower:
         try:
             publish_mask = (allow_publish and self.debug_mask and
                             self.mask_pub.get_num_connections() > 0)
+            # White mask is suppressed entirely in yellow_only mode (the mask
+            # is a zeros array in that case).
             publish_white = (allow_publish and self.debug_white_mask and
+                             self.lane_color_mode != 'yellow_only' and
+                             hasattr(self, 'white_mask_pub') and
                              self.white_mask_pub.get_num_connections() > 0)
             publish_red = (allow_publish and self.finish_enabled and self.debug_mask and
                            self.red_mask_pub.get_num_connections() > 0)
@@ -1243,7 +1315,8 @@ class LaneFollower:
             if self.show_windows:
                 cv2.imshow("lane/bird", bird)
                 cv2.imshow("lane/yellow_mask", yellow_mask)
-                cv2.imshow("lane/white_mask", white_mask)
+                if self.lane_color_mode != 'yellow_only':
+                    cv2.imshow("lane/white_mask", white_mask)
                 if red_mask is not None:
                     cv2.imshow("lane/red_mask", red_mask)
                 if dbg is not None:

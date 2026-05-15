@@ -14,7 +14,7 @@ image:
 performance:
   resize_width: 0
   resize_height: 0
-  max_frame_age: 0.0
+  max_frame_age: 0.30
   processing_rate: 15.0
   process_every_n_frames: 1
 
@@ -24,7 +24,7 @@ speed:
   base_linear: 0.06
   max_linear: 0.08
   min_linear: 0.05
-  max_angular: 1.8
+  max_angular: 1.5
   slow_threshold: 10
   stop_threshold: 80
 
@@ -42,36 +42,40 @@ detection:
   roi_top_ratio: 0.30
   roi_bot_ratio: 1.0
   scanline_ratios: [0.88, 0.82, 0.76, 0.70, 0.64, 0.58]
-  scanline_weights: [1.0, 0.85, 0.65, 0.45, 0.25, 0.15]
+  scanline_weights: [1.0, 0.95, 0.85, 0.75, 0.60, 0.45]
   scanline_band_height: 20
   min_segment_width: 8
-  yellow_fence_gap_px: 100
-  yellow_fence_gap_ratio: 0.08
+  yellow_fence_gap_px: 0
+  yellow_fence_gap_ratio: 0.04
   expected_lane_width_px: 0
   expected_lane_width_ratio: 0.45
   min_lane_width_ratio: 0.15
   max_lane_width_ratio: 0.90
-  strict_lane_width: true
+  strict_lane_width: false
   lane_margin_px: 30
-  max_center_jump_px: 80
-  max_lost_frames: 4
+  max_center_jump_px: 140
+  max_lost_frames: 8
   morph_kernel_size: 5
   white_morph_kernel_size: 7
   white_dilate_iterations: 1
 
 control:
-  enable_anti_loop: false
-  single_line_turn_gain: 1.0
-  drive_straight_when_lost: true
+  enable_anti_loop: true
+  anti_loop_flip_threshold: 5
+  anti_loop_damping: 0.5
+  single_line_turn_gain: 1.5
+  drive_straight_when_lost: false
   lost_straight_speed: 0.0
+  lost_decay: 0.80
+  lost_min_linear: 0.04
 
 finish:
-  enabled: false
-  min_run_time: 8.0
-  required_frames: 6
+  enabled: true
+  min_run_time: 6.0
+  required_frames: 4
   roi_top_ratio: 0.55
-  min_area: 300
-  max_area: 20000
+  min_area: 250
+  max_area: 30000
   stop_after_detect: true
 
 red_marker:
@@ -108,10 +112,10 @@ perspective:
   src_bottom_right: [0.98, 1.00]
 
 far_perspective:
-  enabled: false
+  enabled: true
   min_confidence: 0.18
   dst_margin: 0.15
-  src_top_left: [0.20, 0.10]
-  src_top_right: [0.40, 0.10]
-  src_bottom_left: [0.20, 0.55]
-  src_bottom_right: [0.76, 0.55]
+  src_top_left: [0.10, 0.20]
+  src_top_right: [0.90, 0.20]
+  src_bottom_left: [0.05, 0.55]
+  src_bottom_right: [0.95, 0.55]

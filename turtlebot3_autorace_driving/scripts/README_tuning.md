@@ -1,0 +1,158 @@
+# Auto-tuning the scanline lane follower
+
+This package ships with `scripts/tune_lane_follower.py`, an Optuna-based
+black-box optimizer that runs many headless Gazebo episodes of the AutoRace
+2020 track and saves the best-scoring parameter overlay as
+`param/tuned_lane_follower.yaml`. The tuned file is loaded automatically
+when you pass `tuned_file:=...` to the lane-follower launch.
+
+The white lane is fully disabled in the runtime, so no parameter related
+to it is tuned. Random domain perturbations are applied on top of the
+parameter suggestions to make the result transfer to the real robot.
+
+## 1. One-time prerequisites
+
+```bash
+pip install --user optuna pyyaml rospkg
+sudo apt install ros-noetic-turtlebot3-simulations  # if not already installed
+```
+
+If `roslaunch turtlebot3_gazebo turtlebot3_autorace_2020.launch` complains
+about ambiguity between `/opt/ros/...` and `~/catkin_ws/src/...`, pass the
+full path (the script wants the full path anyway).
+
+Build and source the workspace once after the script was added:
+
+```bash
+cd ~/catkin_ws && catkin_make
+source ~/catkin_ws/devel/setup.bash
+export TURTLEBOT3_MODEL=burger
+```
+
+## 2. Launching the auto-tune (sim only)
+
+```bash
+GAZEBO_LAUNCH=~/catkin_ws/src/turtlebot3_simulations/turtlebot3_gazebo/launch/turtlebot3_autorace_2020.launch
+
+rosrun turtlebot3_autorace_driving tune_lane_follower.py \
+    --trials 80 \
+    --episode-timeout 60 \
+    --gazebo-launch "$GAZEBO_LAUNCH" \
+    --storage sqlite:///$HOME/lf_study.db \
+    --study-name lane_follower_tune
+```
+
+Notes:
+
+- `--trials 80` typically takes 1.5-2.5 hours on a desktop CPU; reduce to
+  30 for a quick smoke run.
+- `--storage sqlite:///...` lets you resume the study after `Ctrl+C` by
+  re-running the same command.
+- The script writes the best parameters to
+  `param/tuned_lane_follower.yaml` of the
+  `turtlebot3_autorace_driving` package and updates that file every time
+  the optimization finishes a better trial.
+
+## 3. Verifying the tuned file
+
+```bash
+cat $(rospack find turtlebot3_autorace_driving)/param/tuned_lane_follower.yaml
+```
+
+Expected: a small YAML containing dotted-section subset like
+
+```yaml
+pid:
+  Kp: 0.0083
+  Kd: 0.0042
+speed:
+  base_linear: 0.072
+  max_angular: 1.45
+control:
+  single_line_turn_gain: 1.62
+  lost_decay: 0.78
+detection:
+  max_lost_frames: 7
+  max_center_jump_px: 132
+```
+
+## 4. Running the tuned lane follower (sim or real)
+
+In the simulator (after launching Gazebo on the appropriate world):
+
+```bash
+roslaunch turtlebot3_autorace_driving turtlebot3_autorace_scanline_lane_following.launch \
+    mode:=action \
+    camera_topic:=/camera/image \
+    camera_compressed_topic:=/camera/image/compressed \
+    tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_lane_follower.yaml
+```
+
+On the real robot (camera bringup on the bot, lane follower on the PC):
+
+```bash
+roslaunch turtlebot3_autorace_driving turtlebot3_autorace_scanline_lane_following.launch \
+    mode:=action \
+    tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_lane_follower.yaml
+```
+
+## 5. Sim2Real calibration checklist
+
+Real lighting, paint and perspective differ from the simulator. Before
+trusting `tuned.yaml`, take 5 minutes to calibrate the yellow HSV mask and
+the bird-eye projection on the actual robot:
+
+1. Start the follower in calibration mode (it publishes debug images but
+   does NOT drive):
+
+   ```bash
+   roslaunch turtlebot3_autorace_driving turtlebot3_autorace_scanline_lane_following.launch \
+       mode:=calibration
+   ```
+
+2. Open rqt and watch `/lane/yellow_mask`. Edit
+   `param/lane_follower_scanline.yaml` -> `yellow_lane.v_low` and
+   `yellow_lane.s_low` until the mask is bright on the lane and dark
+   everywhere else. The white mask is not used (and not published).
+
+3. Watch `/lane/perspective_overlay`. The yellow trapezoid should sit on
+   the ground and span both lane edges. Adjust
+   `perspective.src_top_*` and `perspective.src_bottom_*` until the
+   trapezoid hugs the lane. Save the file and re-launch.
+
+4. Validate the finish marker by holding/printing the red shape and
+   watching `/lane/red_mask`. The mask should light up cleanly. If not,
+   reduce `red_marker.s_low` and `red_marker.v_low` until it does.
+
+5. Run a full lap in `mode:=action`. If the robot under-turns in a
+   specific section, the most useful per-section knobs to tweak by hand:
+
+   - Hairpin (point 2 on the virtual map): bump
+     `control.single_line_turn_gain` to 1.7-1.9.
+   - S-loop around the centre island (points 5-6):
+     `detection.max_center_jump_px` to 160-200 and
+     `control.lost_decay` to 0.85.
+   - Long straight before the finish: leave defaults.
+
+## 6. What gets tuned vs. what is fixed
+
+Tuned by Optuna (per trial):
+
+- `pid.Kp`, `pid.Kd`
+- `speed.base_linear`, `speed.max_angular`
+- `control.single_line_turn_gain`, `control.lost_decay`
+- `detection.max_lost_frames`, `detection.max_center_jump_px`
+
+Domain-randomized on top of each trial (sim2real margin):
+
+- `yellow_lane.v_low`, `yellow_lane.s_low`
+- y-coordinate of `perspective.src_top_left` / `src_top_right`
+
+Fixed (no tuning, intentionally):
+
+- The lane color mode is always `yellow_only`. The white mask is not
+  built, not published, and not consulted.
+- Finish marker thresholds (calibrate visually if the red mark fails
+  to be detected in real lighting).
+- Camera intrinsic calibration (already shipped in
+  `calibration/camera_calibration.yaml`).
