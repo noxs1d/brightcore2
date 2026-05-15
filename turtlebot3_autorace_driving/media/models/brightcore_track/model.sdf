@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="brightcore_track">
+    <static>true</static>
+    <link name="track_link">
+      <pose>0 0 0 0 0 0</pose>
+
+      <collision name="track_collision">
+        <geometry>
+          <box>
+            <size>5.15 4.00 0.005</size>
+          </box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>0.9</mu>
+              <mu2>0.9</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+
+      <visual name="track_visual">
+        <cast_shadows>false</cast_shadows>
+        <pose>0 0 0.003 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>5.15 4.00 0.001</size>
+          </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>model://brightcore_track/materials/scripts</uri>
+            <uri>model://brightcore_track/materials/textures</uri>
+            <name>brightcore_track/road</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

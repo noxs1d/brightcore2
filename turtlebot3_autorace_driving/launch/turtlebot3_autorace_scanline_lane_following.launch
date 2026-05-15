@@ -17,6 +17,7 @@
   <arg name="min_linear" default="0.05"/>
   <arg name="max_angular" default="1.5"/>
   <arg name="enabled" default="true"/>
+  <arg name="rear_camera" default="true" doc="true=real robot (camera mounted at rear, drive backward); false=Gazebo (front camera)"/>
   <arg name="tuned_file" default="" doc="optional YAML with tuned overrides (from Optuna study)"/>
 
   <env name="TURTLEBOT3_MODEL" value="$(arg model)"/>
@@ -46,6 +47,7 @@
     <param name="speed/max_linear" value="$(arg max_linear)"/>
     <param name="speed/min_linear" value="$(arg min_linear)"/>
     <param name="speed/max_angular" value="$(arg max_angular)"/>
+    <param name="drive/rear_camera" value="$(arg rear_camera)"/>
 
     <param if="$(eval mode == 'action')" name="debug/publish_bird_eye" value="$(arg debug)"/>
     <param if="$(eval mode == 'action')" name="debug/publish_perspective_overlay" value="$(arg debug)"/>

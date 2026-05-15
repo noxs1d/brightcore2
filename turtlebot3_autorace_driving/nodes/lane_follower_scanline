@@ -103,6 +103,11 @@ class LaneFollower:
             f"Ready. Waiting for camera frames... processing_rate={self.processing_rate:.1f}Hz")
 
     def _load_params(self):
+        # Real robot has the camera mounted at the rear and drives "backward":
+        # set rear_camera=true to flip linear.x and angular.z signs in _publish_cmd.
+        # Simulators (Gazebo) typically use a front-mounted camera; set false there.
+        self.rear_camera = rospy.get_param('~drive/rear_camera', True)
+
         self.base_speed = rospy.get_param('~speed/base_linear', 0.04)
         self.max_speed = rospy.get_param('~speed/max_linear', 0.06)
         self.min_speed = rospy.get_param('~speed/min_linear', 0.018)
@@ -1157,9 +1162,14 @@ class LaneFollower:
         self.last_linear_cmd = linear_f
         self.last_angular_cmd = angular_f
         t = Twist()
-        # Camera is rear-mounted: drive backward, flip steering
-        t.linear.x = -linear_f
-        t.angular.z = -angular_f
+        if self.rear_camera:
+            # Real robot: camera at the rear, drive backward and mirror steering
+            t.linear.x = -linear_f
+            t.angular.z = -angular_f
+        else:
+            # Simulator / front-mounted camera: drive forward, steer normally
+            t.linear.x = linear_f
+            t.angular.z = angular_f
         self.cmd_pub.publish(t)
 
     def _apply_anti_loop(self, linear, angular):

@@ -1,0 +1,74 @@
+<launch>
+  <!-- ============================================================ -->
+  <!-- BrightCore custom Gazebo track based on CD-digital map.png    -->
+  <!-- Robot spawns inside the red bracket (bottom-right) facing west -->
+  <!-- ============================================================ -->
+
+  <arg name="model" default="$(optenv TURTLEBOT3_MODEL burger)" doc="burger | waffle | waffle_pi"/>
+  <arg name="gui"      default="true"/>
+  <arg name="headless" default="false"/>
+  <arg name="paused"   default="false"/>
+  <arg name="verbose"  default="false"/>
+
+  <!-- Spawn pose (red bracket on the texture).
+       The texture is a 5.15m x 4.0m plane centered at the world origin.
+       Default pose puts the robot just inside the bracket, heading west. -->
+  <arg name="x_pos" default="2.10"/>
+  <arg name="y_pos" default="-1.35"/>
+  <arg name="z_pos" default="0.02"/>
+  <arg name="yaw"   default="3.14159"/>
+
+  <!-- Optionally start the scanline lane follower with sim topics -->
+  <arg name="run_lane_follower" default="false"
+       doc="auto-start lane_follower_scanline configured for /camera/image"/>
+  <arg name="rear_camera"       default="false"
+       doc="set false for Gazebo (front-mounted camera in standard burger URDF)"/>
+  <arg name="tuned_file"        default=""
+       doc="optional YAML overlay produced by tune_lane_follower.py"/>
+
+  <!-- Robot URDF source. Default uses the autorace-flavoured burger if it
+       exists in turtlebot3_description; otherwise override from CLI. -->
+  <arg name="description_file"
+       default="$(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro"
+       doc="path to robot xacro/urdf; override if your sim uses a different camera-equipped model"/>
+
+  <env name="TURTLEBOT3_MODEL" value="$(arg model)"/>
+
+  <!-- Let Gazebo find our model + materials -->
+  <env name="GAZEBO_MODEL_PATH"
+       value="$(find turtlebot3_autorace_driving)/media/models:$(optenv GAZEBO_MODEL_PATH)"/>
+  <env name="GAZEBO_RESOURCE_PATH"
+       value="$(find turtlebot3_autorace_driving)/media:$(optenv GAZEBO_RESOURCE_PATH)"/>
+
+  <!-- Start Gazebo with our world -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find turtlebot3_autorace_driving)/worlds/brightcore_track.world"/>
+    <arg name="paused"     value="$(arg paused)"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui"        value="$(arg gui)"/>
+    <arg name="headless"   value="$(arg headless)"/>
+    <arg name="debug"      value="false"/>
+    <arg name="verbose"    value="$(arg verbose)"/>
+  </include>
+
+  <!-- Load robot description -->
+  <param name="robot_description"
+         command="$(find xacro)/xacro --inorder $(arg description_file)"/>
+
+  <!-- Spawn the robot at the red bracket -->
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -model turtlebot3_$(arg model)
+              -x $(arg x_pos) -y $(arg y_pos) -z $(arg z_pos) -Y $(arg yaw)
+              -param robot_description"
+        respawn="false" output="screen"/>
+
+  <!-- Optional: bring up the lane follower configured for the sim camera -->
+  <include if="$(arg run_lane_follower)"
+           file="$(find turtlebot3_autorace_driving)/launch/turtlebot3_autorace_scanline_lane_following.launch">
+    <arg name="camera_topic"            value="/camera/image"/>
+    <arg name="camera_compressed_topic" value="/camera/image/compressed"/>
+    <arg name="use_compressed"          value="true"/>
+    <arg name="rear_camera"             value="$(arg rear_camera)"/>
+    <arg name="tuned_file"              value="$(arg tuned_file)"/>
+  </include>
+</launch>

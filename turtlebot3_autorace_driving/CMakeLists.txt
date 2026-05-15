@@ -44,7 +44,7 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-install(DIRECTORY launch
+install(DIRECTORY launch worlds media
 	DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 

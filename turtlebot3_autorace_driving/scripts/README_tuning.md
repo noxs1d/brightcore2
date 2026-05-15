@@ -31,6 +31,38 @@ export TURTLEBOT3_MODEL=burger
 
 ## 2. Launching the auto-tune (sim only)
 
+### 2.a. Recommended: BrightCore custom track
+
+The package now ships a Gazebo world built from `CD-digital map.png`. The
+robot spawns inside the red bracket (bottom-right of the texture) facing
+the bottom corridor, which matches the real-world starting position.
+
+```bash
+GAZEBO_LAUNCH=$(rospack find turtlebot3_autorace_driving)/launch/brightcore_track.launch
+
+rosrun turtlebot3_autorace_driving tune_lane_follower.py \
+    --trials 80 \
+    --episode-timeout 60 \
+    --gazebo-launch "$GAZEBO_LAUNCH" \
+    --storage sqlite:///$HOME/lf_study.db \
+    --study-name lane_follower_tune
+```
+
+To preview the world (no tuning, just look at it):
+
+```bash
+roslaunch turtlebot3_autorace_driving brightcore_track.launch gui:=true
+```
+
+To preview the world AND let the lane follower drive on it:
+
+```bash
+roslaunch turtlebot3_autorace_driving brightcore_track.launch \
+    gui:=true run_lane_follower:=true rear_camera:=false
+```
+
+### 2.b. Alternative: stock AutoRace 2020 track
+
 ```bash
 GAZEBO_LAUNCH=~/catkin_ws/src/turtlebot3_simulations/turtlebot3_gazebo/launch/turtlebot3_autorace_2020.launch
 
@@ -78,13 +110,23 @@ detection:
 
 ## 4. Running the tuned lane follower (sim or real)
 
-In the simulator (after launching Gazebo on the appropriate world):
+In the simulator on the BrightCore track:
+
+```bash
+roslaunch turtlebot3_autorace_driving brightcore_track.launch \
+    gui:=true run_lane_follower:=true rear_camera:=false \
+    tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_lane_follower.yaml
+```
+
+In any sim where you already have Gazebo running (front-mounted camera on
+`/camera/image`):
 
 ```bash
 roslaunch turtlebot3_autorace_driving turtlebot3_autorace_scanline_lane_following.launch \
     mode:=action \
     camera_topic:=/camera/image \
     camera_compressed_topic:=/camera/image/compressed \
+    rear_camera:=false \
     tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_lane_follower.yaml
 ```
 
@@ -93,6 +135,7 @@ On the real robot (camera bringup on the bot, lane follower on the PC):
 ```bash
 roslaunch turtlebot3_autorace_driving turtlebot3_autorace_scanline_lane_following.launch \
     mode:=action \
+    rear_camera:=true \
     tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_lane_follower.yaml
 ```
 
