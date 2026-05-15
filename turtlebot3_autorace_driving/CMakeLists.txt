@@ -38,9 +38,12 @@ catkin_package(
 ################################################################################
 catkin_install_python(PROGRAMS
   nodes/control_lane
+  nodes/control_lane_param
+  nodes/cmd_vel_invert
   nodes/control_moving
   nodes/lane_follower_scanline
   scripts/tune_lane_follower.py
+  scripts/tune_control_lane.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

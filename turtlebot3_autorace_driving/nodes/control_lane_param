@@ -1,0 +1,622 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Stateful AutoRace lane controller forked from catkin_ws (see plan).
+# Gains / speeds / thresholds / yellow HSV are overrideable via rosparam
+# (~gains/, ~max_speed/, ~thresholds/, ~hsv/) — defaults match upstream.
+
+import rospy
+import numpy as np
+import cv2
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from collections import deque
+
+STATE_STRAIGHT = 0
+STATE_CURVE = 1
+STATE_CIRCLE = 2
+STATE_LOST = 3
+STATE_RECOVER = 4
+STATE_FINISHED = 5
+STATE_PARKING = 6
+STATE_KEEP_LEFT = 7
+STATE_TURN_LEFT = 8
+
+STATE_NAMES = {
+    STATE_STRAIGHT: "STRAIGHT",
+    STATE_CURVE: "CURVE",
+    STATE_CIRCLE: "CIRCLE",
+    STATE_LOST: "LOST",
+    STATE_RECOVER: "RECOVER",
+    STATE_FINISHED: "FINISHED",
+    STATE_PARKING: "PARKING",
+    STATE_KEEP_LEFT: "KEEP_LEFT",
+    STATE_TURN_LEFT: "TURN_LEFT",
+}
+
+
+class PID:
+    def __init__(self, kp, ki, kd, integral_limit=300.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integral_limit = integral_limit
+        self._integral = 0.0
+        self._last_error = 0.0
+        self._last_time = None
+
+    def reset(self):
+        self._integral = 0.0
+        self._last_error = 0.0
+        self._last_time = None
+
+    def compute(self, error):
+        now = rospy.get_time()
+        dt = 0.05 if self._last_time is None else max(now - self._last_time, 0.001)
+        self._last_time = now
+        self._integral = np.clip(
+            self._integral + error * dt,
+            -self.integral_limit,
+            self.integral_limit,
+        )
+        derivative = (error - self._last_error) / dt
+        self._last_error = error
+        return self.kp * error + self.ki * self._integral + self.kd * derivative
+
+    def set_gains(self, kp, ki, kd):
+        self.kp, self.ki, self.kd = kp, ki, kd
+
+
+class EMAFilter:
+    def __init__(self, alpha=0.30):
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, v):
+        self.value = v if self.value is None else self.alpha * v + (1 - self.alpha) * self.value
+        return self.value
+
+    def reset(self):
+        self.value = None
+
+
+class ErrorAnalyser:
+    def __init__(self, window=25):
+        self._buf = deque(maxlen=window)
+
+    def push(self, e):
+        self._buf.append(e)
+
+    def reset(self):
+        self._buf.clear()
+
+    def mean_abs(self):
+        return float(np.mean(np.abs(self._buf))) if self._buf else 0.0
+
+    def variance(self):
+        return float(np.var(self._buf)) if len(self._buf) >= 3 else 0.0
+
+    def sign_change_rate(self):
+        if len(self._buf) < 2:
+            return 0.0
+        a = list(self._buf)
+        return (
+            sum(1 for i in range(1, len(a)) if a[i] * a[i - 1] < 0) / float(len(a))
+        )
+
+
+class YellowWallDetector:
+    YELLOW_LOW = np.array([15, 80, 80])
+    YELLOW_HIGH = np.array([35, 255, 255])
+
+    def __init__(self):
+        self.bridge = CvBridge()
+        self.proximity = 0.0
+        self.sub = rospy.Subscriber(
+            "/camera/image_projected_compensated",
+            Image,
+            self._cb,
+            queue_size=1,
+        )
+
+    def _cb(self, msg):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception:
+            return
+        h, _w = img.shape[:2]
+        roi = img[int(h * 0.80):h, :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.YELLOW_LOW, self.YELLOW_HIGH)
+        px = int(np.sum(mask > 0))
+        CLOSE = 800
+        DANGER = 2000
+        if px > DANGER:
+            self.proximity = 1.0
+        elif px > CLOSE:
+            self.proximity = (px - CLOSE) / float(DANGER - CLOSE)
+        else:
+            self.proximity = 0.0
+
+
+class ParkingLaneHandler:
+    WHITE_LOW = np.array([0, 0, 200])
+    WHITE_HIGH = np.array([180, 60, 255])
+
+    MEMORY_FRAMES = 20
+    ENTER_FRAMES = 8
+    EXIT_FRAMES = 30
+
+    def __init__(self):
+        self.bridge = CvBridge()
+        self.centre = None
+        self.image_width = 640
+        self.last_centre = None
+        self.missing_count = 0
+        self.detected_count = 0
+        self.in_parking_zone = False
+        self.just_exited = False
+
+        self.sub = rospy.Subscriber(
+            "/camera/image_projected_compensated",
+            Image,
+            self._cb,
+            queue_size=1,
+        )
+
+    def _cb(self, msg):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception:
+            return
+
+        h, w = img.shape[:2]
+        self.image_width = w
+
+        roi = img[int(h * 0.40):h, :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(hsv, self.WHITE_LOW, self.WHITE_HIGH)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 20))
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+        kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel2)
+
+        contours, _ = cv2.findContours(
+            white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        lines = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 200:
+                x, _y, cw, _ch = cv2.boundingRect(cnt)
+                lines.append(x + cw // 2)
+
+        if len(lines) < 2:
+            self.missing_count += 1
+            self.detected_count = 0
+            if self.missing_count > self.MEMORY_FRAMES:
+                self.centre = None
+            else:
+                self.centre = self.last_centre
+
+            if self.in_parking_zone and self.missing_count > self.EXIT_FRAMES:
+                self.in_parking_zone = False
+                self.just_exited = True
+            return
+
+        self.missing_count = 0
+        self.detected_count += 1
+        self.just_exited = False
+
+        lines.sort()
+        self.centre = float((lines[0] + lines[-1]) / 2.0)
+        self.last_centre = self.centre
+
+        if self.detected_count >= self.ENTER_FRAMES:
+            self.in_parking_zone = True
+
+
+class RoadCentreDetector:
+    GREY_LOW = np.array([0, 0, 80])
+    GREY_HIGH = np.array([180, 50, 200])
+    WHITE_LOW = np.array([0, 0, 200])
+    WHITE_HIGH = np.array([180, 60, 255])
+    YELLOW_LOW = np.array([15, 80, 80])
+    YELLOW_HIGH = np.array([35, 255, 255])
+    RED_LOW1 = np.array([0, 120, 100])
+    RED_HIGH1 = np.array([10, 255, 255])
+    RED_LOW2 = np.array([170, 120, 100])
+    RED_HIGH2 = np.array([180, 255, 255])
+
+    RED_PIXEL_THRESH = 400
+    ROAD_PIXEL_THRESH = 500
+
+    def __init__(self):
+        self.bridge = CvBridge()
+        self.road_centre = None
+        self.image_width = 640
+        self.red_detected = False
+        self.sub = rospy.Subscriber(
+            "/camera/image_projected_compensated",
+            Image,
+            self._cb,
+            queue_size=1,
+        )
+
+    def _cb(self, msg):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception:
+            return
+
+        h, w = img.shape[:2]
+        self.image_width = w
+
+        bottom = img[int(h * 0.55):h, :]
+        hsv_b = cv2.cvtColor(bottom, cv2.COLOR_BGR2HSV)
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv_b, self.RED_LOW1, self.RED_HIGH1),
+            cv2.inRange(hsv_b, self.RED_LOW2, self.RED_HIGH2),
+        )
+        self.red_detected = int(np.sum(red_mask > 0)) > self.RED_PIXEL_THRESH
+
+        roi = img[int(h * 0.50):h, :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        grey_mask = cv2.inRange(hsv, self.GREY_LOW, self.GREY_HIGH)
+        yellow_mask = cv2.inRange(hsv, self.YELLOW_LOW, self.YELLOW_HIGH)
+        white_mask = cv2.inRange(hsv, self.WHITE_LOW, self.WHITE_HIGH)
+
+        road_mask = cv2.bitwise_and(
+            grey_mask,
+            cv2.bitwise_not(cv2.bitwise_or(yellow_mask, white_mask)),
+        )
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_OPEN, kernel)
+        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, kernel)
+
+        road_pixels = int(np.sum(road_mask > 0))
+        if road_pixels < self.ROAD_PIXEL_THRESH:
+            self.road_centre = None
+            return
+
+        cols = np.where(road_mask > 0)[1]
+        self.road_centre = float(np.mean(cols))
+
+
+class ControlLaneParam:
+    GAINS = {
+        STATE_STRAIGHT: (0.0035, 0.0001, 0.0070),
+        STATE_CURVE: (0.0055, 0.0002, 0.0110),
+        STATE_CIRCLE: (0.0070, 0.0004, 0.0140),
+        STATE_RECOVER: (0.0075, 0.0000, 0.0050),
+        STATE_LOST: (0.0035, 0.0000, 0.0070),
+        STATE_FINISHED: (0.0000, 0.0000, 0.0000),
+        STATE_PARKING: (0.0030, 0.0001, 0.0060),
+        STATE_KEEP_LEFT: (0.0000, 0.0000, 0.0000),
+        STATE_TURN_LEFT: (0.0000, 0.0000, 0.0000),
+    }
+
+    MAX_SPEED = {
+        STATE_STRAIGHT: 0.25,
+        STATE_CURVE: 0.12,
+        STATE_CIRCLE: 0.07,
+        STATE_RECOVER: 0.00,
+        STATE_LOST: 0.00,
+        STATE_FINISHED: 0.00,
+        STATE_PARKING: 0.18,
+        STATE_KEEP_LEFT: 0.08,
+        STATE_TURN_LEFT: 0.04,
+    }
+
+    ANG_LIMIT = {
+        STATE_STRAIGHT: 0.70,
+        STATE_CURVE: 1.30,
+        STATE_CIRCLE: 1.80,
+        STATE_RECOVER: 1.10,
+        STATE_LOST: 0.50,
+        STATE_FINISHED: 0.00,
+        STATE_PARKING: 0.35,
+        STATE_KEEP_LEFT: 0.00,
+        STATE_TURN_LEFT: 1.57,
+    }
+
+    TURN_LEFT_DURATION = 2.0
+    KEEP_LEFT_TIMEOUT = 1.8
+
+    STRAIGHT_ERR_THRESH = 55.0
+    CURVE_ERR_THRESH = 110.0
+    CIRCLE_VAR_THRESH = 3000.0
+    CIRCLE_SCR_THRESH = 0.22
+    LOST_MISS_THRESH = 15
+    RECOVER_FRAMES = 30
+
+    def _patch_yellow_hsv_from_ros(self):
+        s_low = int(rospy.get_param("~hsv/yellow/s_low", int(self._base_yellow_s)))
+        v_low = int(rospy.get_param("~hsv/yellow/v_low", int(self._base_yellow_v)))
+        hHue = int(RoadCentreDetector.YELLOW_LOW[0])
+        ys = np.array([hHue, s_low, v_low])
+        RoadCentreDetector.YELLOW_LOW = ys.copy()
+        YellowWallDetector.YELLOW_LOW = ys.copy()
+
+    def _load_rosparam_overrides(self):
+        g = rospy.get_param
+        cl = ControlLaneParam
+        tpl = lambda st: cl.GAINS[st]
+        cl.GAINS[STATE_STRAIGHT] = (
+            g("~gains/straight/kp", tpl(STATE_STRAIGHT)[0]),
+            g("~gains/straight/ki", tpl(STATE_STRAIGHT)[1]),
+            g("~gains/straight/kd", tpl(STATE_STRAIGHT)[2]),
+        )
+        cl.GAINS[STATE_CURVE] = (
+            g("~gains/curve/kp", tpl(STATE_CURVE)[0]),
+            g("~gains/curve/ki", tpl(STATE_CURVE)[1]),
+            g("~gains/curve/kd", tpl(STATE_CURVE)[2]),
+        )
+        cl.GAINS[STATE_CIRCLE] = (
+            g("~gains/circle/kp", tpl(STATE_CIRCLE)[0]),
+            g("~gains/circle/ki", tpl(STATE_CIRCLE)[1]),
+            g("~gains/circle/kd", tpl(STATE_CIRCLE)[2]),
+        )
+        cl.GAINS[STATE_RECOVER] = (
+            g("~gains/recover/kp", tpl(STATE_RECOVER)[0]),
+            g("~gains/recover/ki", tpl(STATE_RECOVER)[1]),
+            g("~gains/recover/kd", tpl(STATE_RECOVER)[2]),
+        )
+
+        cl.MAX_SPEED[STATE_STRAIGHT] = g(
+            "~max_speed/straight", cl.MAX_SPEED[STATE_STRAIGHT]
+        )
+        cl.MAX_SPEED[STATE_CURVE] = g("~max_speed/curve", cl.MAX_SPEED[STATE_CURVE])
+        cl.MAX_SPEED[STATE_CIRCLE] = g("~max_speed/circle", cl.MAX_SPEED[STATE_CIRCLE])
+
+        self.STRAIGHT_ERR_THRESH = g(
+            "~thresholds/straight_err", ControlLaneParam.STRAIGHT_ERR_THRESH
+        )
+        self.CURVE_ERR_THRESH = g(
+            "~thresholds/curve_err", ControlLaneParam.CURVE_ERR_THRESH
+        )
+        self.CIRCLE_VAR_THRESH = g(
+            "~thresholds/circle_var", ControlLaneParam.CIRCLE_VAR_THRESH
+        )
+        self.CIRCLE_SCR_THRESH = g(
+            "~thresholds/circle_scr", ControlLaneParam.CIRCLE_SCR_THRESH
+        )
+
+    def __init__(self):
+        self._base_yellow_s = int(RoadCentreDetector.YELLOW_LOW[1])
+        self._base_yellow_v = int(RoadCentreDetector.YELLOW_LOW[2])
+
+        self._load_rosparam_overrides()
+        self._patch_yellow_hsv_from_ros()
+
+        self.sub_lane = rospy.Subscriber(
+            "/control/lane",
+            Float64,
+            self.cb_lane,
+            queue_size=1,
+        )
+        self.sub_max_vel = rospy.Subscriber(
+            "/control/max_vel",
+            Float64,
+            self.cb_max_vel,
+            queue_size=1,
+        )
+        self.pub_cmd_vel = rospy.Publisher(
+            "/control/cmd_vel",
+            Twist,
+            queue_size=1,
+        )
+
+        self.pid = PID(*self.GAINS[STATE_STRAIGHT])
+        self.ema = EMAFilter(alpha=0.30)
+        self.analyser = ErrorAnalyser(window=25)
+        self.detector = RoadCentreDetector()
+        self.parking = ParkingLaneHandler()
+        self.yellow_wall = YellowWallDetector()
+
+        self.state = STATE_STRAIGHT
+        self.prev_state = STATE_STRAIGHT
+        self.missing_frames = 0
+        self.recover_count = 0
+        self.last_good_error = 0.0
+        self.vel_cap = 0.25
+        self.turn_start_time = None
+        self.keep_left_start = None
+
+        rospy.on_shutdown(self.shutdown)
+        rospy.loginfo("[ControlLaneParam] Ready — state: STRAIGHT")
+
+    def cb_max_vel(self, msg):
+        self.vel_cap = float(msg.data)
+
+    def cb_lane(self, msg):
+        if self.detector.red_detected:
+            if self.state != STATE_FINISHED:
+                self._transition(STATE_FINISHED)
+                rospy.loginfo("[ControlLane] RED ZONE — FINISHED!")
+            self._publish(0.0, 0.0)
+            return
+
+        if self.state == STATE_FINISHED:
+            self._transition(STATE_STRAIGHT)
+
+        if self.state == STATE_KEEP_LEFT:
+            elapsed = rospy.get_time() - self.keep_left_start
+            if elapsed > self.KEEP_LEFT_TIMEOUT:
+                rospy.loginfo("[ControlLane] KEEP_LEFT done — TURN LEFT!")
+                self._publish(0.0, 0.0)
+                rospy.sleep(0.15)
+                self._transition(STATE_TURN_LEFT)
+                self.turn_start_time = rospy.get_time()
+            else:
+                self._publish(self.MAX_SPEED[STATE_KEEP_LEFT], 0.0)
+            return
+
+        if self.state == STATE_TURN_LEFT:
+            elapsed = rospy.get_time() - self.turn_start_time
+            if elapsed < self.TURN_LEFT_DURATION:
+                self._publish(self.MAX_SPEED[STATE_TURN_LEFT], 1.0)
+            else:
+                rospy.loginfo("[ControlLane] Turn complete — STRAIGHT")
+                self.parking.detected_count = 0
+                self.parking.in_parking_zone = False
+                self.ema.reset()
+                self.analyser.reset()
+                self._transition(STATE_STRAIGHT)
+            return
+
+        if self.parking.just_exited:
+            self.parking.just_exited = False
+            rospy.loginfo("[ControlLane] Parking done — KEEP_LEFT")
+            self._transition(STATE_KEEP_LEFT)
+            self.keep_left_start = rospy.get_time()
+            return
+
+        if self.parking.in_parking_zone or self.parking.detected_count >= self.parking.ENTER_FRAMES:
+            self._handle_parking()
+            return
+
+        if self.detector.road_centre is not None:
+            raw_centre = self.detector.road_centre
+            target = self.detector.image_width / 2.0
+        else:
+            raw_centre = float(msg.data)
+            target = 500.0
+            if raw_centre < 50 or raw_centre > 950:
+                self.missing_frames += 1
+                self._handle_lost()
+                return
+
+        self.missing_frames = 0
+        smooth = self.ema.update(raw_centre)
+        error = smooth - target
+        self.analyser.push(error)
+
+        self._update_state(error)
+
+        angular_raw = self.pid.compute(error)
+        speed = self._adaptive_speed(abs(error))
+        ang_lim = self.ANG_LIMIT[self.state]
+        angular = float(np.clip(-angular_raw, -ang_lim, ang_lim))
+
+        self._publish(speed, angular)
+        self.last_good_error = error
+
+    def _handle_parking(self):
+        if self.state != STATE_PARKING:
+            self._transition(STATE_PARKING)
+
+        centre = self.parking.centre
+        if centre is None:
+            self._publish(self.MAX_SPEED[STATE_PARKING], 0.0)
+            return
+
+        target = self.parking.image_width / 2.0
+        error = self.ema.update(centre) - target
+        angular_raw = self.pid.compute(error)
+        ang_lim = self.ANG_LIMIT[STATE_PARKING]
+        angular = float(np.clip(-angular_raw, -ang_lim, ang_lim))
+        self._publish(self.MAX_SPEED[STATE_PARKING], angular)
+
+    def _update_state(self, error):
+        if self.state in (
+            STATE_RECOVER,
+            STATE_FINISHED,
+            STATE_PARKING,
+            STATE_KEEP_LEFT,
+            STATE_TURN_LEFT,
+        ):
+            if self.state == STATE_RECOVER:
+                self.recover_count += 1
+                if self.recover_count >= self.RECOVER_FRAMES:
+                    self._transition(STATE_STRAIGHT)
+            return
+
+        ma = self.analyser.mean_abs()
+        var = self.analyser.variance()
+        scr = self.analyser.sign_change_rate()
+
+        if var > self.CIRCLE_VAR_THRESH and scr > self.CIRCLE_SCR_THRESH:
+            if self.state != STATE_CIRCLE:
+                self._transition(STATE_CIRCLE)
+        elif ma > self.CURVE_ERR_THRESH:
+            if self.state != STATE_CURVE:
+                self._transition(STATE_CURVE)
+        elif ma < self.STRAIGHT_ERR_THRESH:
+            if self.state != STATE_STRAIGHT:
+                self._transition(STATE_STRAIGHT)
+
+    def _handle_lost(self):
+        if self.missing_frames >= self.LOST_MISS_THRESH:
+            if self.state != STATE_LOST:
+                self._transition(STATE_LOST)
+            ang = 0.35 if self.last_good_error > 0 else -0.35
+            self._publish(0.0, ang)
+
+    def _transition(self, new_state):
+        if new_state == self.state:
+            return
+        rospy.loginfo(
+            "[ControlLane] %s → %s",
+            STATE_NAMES[self.state],
+            STATE_NAMES[new_state],
+        )
+        self.prev_state = self.state
+        self.state = new_state
+        if new_state == STATE_RECOVER:
+            self.recover_count = 0
+            self.pid.reset()
+            self.analyser.reset()
+        self.pid.set_gains(*self.GAINS.get(new_state, self.GAINS[STATE_STRAIGHT]))
+
+    def _adaptive_speed(self, abs_error):
+        if self.state in (STATE_LOST, STATE_RECOVER, STATE_FINISHED):
+            return 0.0
+
+        max_spd = min(self.MAX_SPEED[self.state], self.vel_cap)
+
+        if self.state == STATE_CIRCLE:
+            if abs_error > 60:
+                max_spd = max_spd * 0.5
+            elif abs_error > 30:
+                max_spd = max_spd * 0.75
+
+        prox = self.yellow_wall.proximity
+        if prox > 0.7:
+            max_spd = max_spd * 0.6
+
+        if abs_error > 200:
+            self._transition(STATE_RECOVER)
+            return -0.02
+
+        if abs_error > 140:
+            return float(max_spd * 0.10)
+
+        if abs_error > 80:
+            return float(max_spd * 0.35)
+
+        factor = (1.0 - (abs_error / 140.0) ** 1.8)
+        return float(max_spd * max(0.0, factor))
+
+    def _publish(self, linear_x, angular_z):
+        t = Twist()
+        t.linear.x = float(linear_x)
+        t.angular.z = float(angular_z)
+        self.pub_cmd_vel.publish(t)
+
+    def shutdown(self):
+        rospy.loginfo("[ControlLaneParam] Shutdown.")
+        self._publish(0.0, 0.0)
+
+    def main(self):
+        rospy.spin()
+
+
+if __name__ == "__main__":
+    rospy.init_node("control_lane_param")
+    node = ControlLaneParam()
+    node.main()

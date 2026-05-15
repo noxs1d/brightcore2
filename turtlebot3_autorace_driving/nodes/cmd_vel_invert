@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Relay: subscribe /cmd_vel_raw, flip linear.x & angular.z, publish /cmd_vel (rear-mounted camera bots)."""
+
+import rospy
+from geometry_msgs.msg import Twist
+
+
+def main():
+    rospy.init_node('cmd_vel_invert')
+    pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+
+    def cb(msg):
+        out = Twist()
+        out.linear.x = -float(msg.linear.x)
+        out.linear.y = msg.linear.y
+        out.linear.z = msg.linear.z
+        out.angular.x = msg.angular.x
+        out.angular.y = msg.angular.y
+        out.angular.z = -float(msg.angular.z)
+        pub.publish(out)
+
+    rospy.Subscriber('/cmd_vel_raw', Twist, cb, queue_size=10)
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

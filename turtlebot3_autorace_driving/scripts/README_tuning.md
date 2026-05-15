@@ -199,3 +199,51 @@ Fixed (no tuning, intentionally):
   to be detected in real lighting).
 - Camera intrinsic calibration (already shipped in
   `calibration/camera_calibration.yaml`).
+
+## 7. State-machine `control_lane_param` + Optuna (AutoRace 2020)
+
+This path uses the **forked** state-machine controller (`nodes/control_lane_param`)
+with ROIs on bird-eye (`/camera/image_projected_compensated`), same stack as
+`~/catkin_ws/src/turtlebot3_autorace_2020/launch_autorace.launch`, but with
+tunable gains in `param/control_lane.yaml` and `tuned_file` overlay.
+
+**Smoke test (manual, before tuning):** from a sourced workspace that has
+`turtlebot3_gazebo`, `turtlebot3_autorace_camera`, `turtlebot3_autorace_detect`:
+
+```bash
+roslaunch turtlebot3_autorace_driving autorace_sim_with_param.launch gui:=true
+```
+
+Expect the burger to complete the AutoRace 2020 lap (like the original
+`control_lane` chain).
+
+**3-hour tuning (headless, roscore in another terminal):**
+
+```bash
+export TURTLEBOT3_MODEL=burger
+SIM="$(rospack find turtlebot3_autorace_driving)/launch/autorace_sim_with_param.launch"
+
+rosrun turtlebot3_autorace_driving tune_control_lane.py \
+    --trials 150 --episode-timeout 75 \
+    --sim-launch "$SIM" \
+    --storage sqlite:///$HOME/cl_study.db \
+    --study-name control_lane_tune
+```
+
+Best overlay is written to `param/tuned_control_lane.yaml`. Load it in sim:
+
+```bash
+roslaunch turtlebot3_autorace_driving autorace_sim_with_param.launch \
+    tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_control_lane.yaml
+```
+
+**Real robot (rear camera):** camera bridge + intrinsic + extrinsic + detect as in
+`AGENTS.md`, then:
+
+```bash
+roslaunch turtlebot3_autorace_driving autorace_real.launch \
+    tuned_file:=$(rospack find turtlebot3_autorace_driving)/param/tuned_control_lane.yaml
+```
+
+`autorace_real.launch` publishes commands to `/cmd_vel_raw` and `cmd_vel_invert`
+mirrors signs onto `/cmd_vel` for TurtleBot hardware that expects inverted drive.

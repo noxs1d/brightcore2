@@ -1,0 +1,24 @@
+<launch>
+  <arg name="tuned_file" default=""/>
+  <arg name="gui" default="false" doc="false for headless tuning"/>
+  <arg name="cmd_vel_out" default="/cmd_vel"/>
+
+  <include file="$(find turtlebot3_gazebo)/launch/turtlebot3_autorace_2020.launch">
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+
+  <include file="$(find turtlebot3_autorace_camera)/launch/intrinsic_camera_calibration.launch"/>
+
+  <include file="$(find turtlebot3_autorace_detect)/launch/detect_lane.launch">
+    <arg name="mode" value="action"/>
+  </include>
+
+  <include file="$(find turtlebot3_autorace_camera)/launch/extrinsic_camera_calibration.launch">
+    <arg name="mode" value="action"/>
+  </include>
+
+  <include file="$(find turtlebot3_autorace_driving)/launch/turtlebot3_autorace_control_lane_param.launch">
+    <arg name="tuned_file" value="$(arg tuned_file)"/>
+    <arg name="cmd_vel_out" value="$(arg cmd_vel_out)"/>
+  </include>
+</launch>

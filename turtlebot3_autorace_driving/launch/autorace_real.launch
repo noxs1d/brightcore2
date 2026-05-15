@@ -1,0 +1,22 @@
+<launch>
+  <arg name="tuned_file" default="" doc="YAML from tune_control_lane.py; leave empty for base control_lane.yaml"/>
+  <arg name="cmd_vel_out" default="/cmd_vel_raw"/>
+
+  <include file="$(find turtlebot3_autorace_camera)/launch/intrinsic_camera_calibration.launch"/>
+
+  <include file="$(find turtlebot3_autorace_camera)/launch/extrinsic_camera_calibration.launch">
+    <arg name="mode" value="action"/>
+  </include>
+
+  <include file="$(find turtlebot3_autorace_detect)/launch/detect_lane.launch">
+    <arg name="mode" value="action"/>
+  </include>
+
+  <include file="$(find turtlebot3_autorace_driving)/launch/turtlebot3_autorace_control_lane_param.launch">
+    <arg name="tuned_file" value="$(arg tuned_file)"/>
+    <arg name="cmd_vel_out" value="$(arg cmd_vel_out)"/>
+  </include>
+
+  <node pkg="turtlebot3_autorace_driving" type="cmd_vel_invert"
+        name="cmd_vel_invert" output="screen"/>
+</launch>

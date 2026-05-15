@@ -1,0 +1,14 @@
+<launch>
+  <arg name="tuned_file" default="" doc="optional YAML overlay (Optuna); empty = use only control_lane.yaml"/>
+  <arg name="cmd_vel_out" default="/cmd_vel" doc="remap /control/cmd_vel to this topic (e.g. /cmd_vel_raw for rear camera adapter)"/>
+
+  <node pkg="turtlebot3_autorace_driving" type="control_lane_param"
+        name="control_lane" output="screen">
+    <rosparam command="load" file="$(find turtlebot3_autorace_driving)/param/control_lane.yaml"/>
+    <rosparam if="$(eval tuned_file != '')" file="$(arg tuned_file)" command="load"/>
+
+    <remap from="/control/lane" to="/detect/lane"/>
+    <remap from="/control/cmd_vel" to="$(arg cmd_vel_out)"/>
+    <remap from="/control/max_vel" to="/control/max_vel"/>
+  </node>
+</launch>
